@@ -1,0 +1,18 @@
+{
+  "name": "tsidp-mcp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=../.env src/index.js",
+    "verify": "node --env-file=../.env src/verify.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2",
+    "@modelcontextprotocol/express": "^2",
+    "@modelcontextprotocol/node": "^2",
+    "@modelcontextprotocol/server": "^2",
+    "express": "^5",
+    "pg": "^8",
+    "zod": "^4"
+  }
+}
