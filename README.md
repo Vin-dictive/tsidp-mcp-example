@@ -57,8 +57,8 @@ flowchart TD
   tagged -- no --> whois["tsidp runs WhoIs on the browser's device and stores that user and their grants"]
   whois --> claims["Grants for autogroup:owner, admin, member add extraClaims groups to userinfo"]
   claims --> token["Token issued for resource https://mac-muon.taila6207e.ts.net/mcp. Aperture stores it for this user only"]
-  token --> call["Tool call: Authorization: Bearer user token"]
-  call --> serve["tailscale serve, then server/ on 127.0.0.1:9933"]
+  token --> toolcall["Tool call: Authorization: Bearer user token"]
+  toolcall --> serve["tailscale serve, then server/ on 127.0.0.1:9933"]
   serve --> intro["POST tsidp /introspect: active, aud equals RESOURCE_URL"]
   intro -- inactive or wrong audience --> u401["401"]
   intro -- ok --> userinfo["GET tsidp /userinfo: read groups"]
@@ -272,28 +272,6 @@ The gateway is `https://aperture.taila6207e.ts.net`. It can reach the shop serve
 `shopshared` uses one bearer for every granted user. The secret is `SHARED_TOKEN` in `.env`. That caller shows up as `sub` `shared` with no groups, so it only gets `whoami`. Caller identity headers only reach the server on the direct listener; see [Compare Caller identity on and off](#compare-caller-identity-on-and-off).
 
 `shopuser` is per-user. Aperture registers a client with tsidp (`oauth2_dcr`) and stores a separate token for each Tailscale user. Each person opens Connectors in Aperture Chat and selects Connect. Do that from an untagged device (the iPhone or another machine logged in as you). This Mac is tagged, and tsidp rejects that login.
-
-## URL for Cursor
-
-`https://mac-muon.taila6207e.ts.net/mcp`
-
-```json
-{
-  "mcpServers": {
-    "shop-catalog": {
-      "url": "http://127.0.0.1:9933/mcp"
-    }
-  }
-}
-```
-
-Cursor follows the `401` `WWW-Authenticate` challenge to `http://127.0.0.1:9933/.well-known/oauth-protected-resource/mcp`, then to tsidp. The tools that appear depend on the token's `groups` claim.
-
-## Why login from this Mac does not work yet
-
-`mac-muon` is a tagged node (`tag:relay-devices`, `tag:tagged-devices`), not the user `vinay.valson@gmail.com`. Current tsidp rejects `/authorize` for tagged nodes with `tagged node doesn't have a user identity` (`server/authorize.go`). Cursor on this Mac would present that tagged node, so the browser login fails until this Mac is logged into Tailscale as the user, or Cursor is used from an untagged device.
-
-Running tsidp with `--use-local-tailscaled` on this Mac was tried and stopped. In that mode tsidp only accepts identity from Tailscale Serve's `X-Forwarded-For` header, and binding the tailscale address took the connection before Serve could add the header (`Error getting WhoIs`). The MCP server is published with `tailscale serve --bg 9933`, which proxies `https://mac-muon.taila6207e.ts.net/` to `http://127.0.0.1:9933`.
 
 ## Stop
 
