@@ -63,6 +63,15 @@ sameTools(doc.tools, ["whoami"]);
 console.log(`whoami ok: ${JSON.stringify({ login: doc.login, name: doc.name, groups: doc.groups, tools: doc.tools })}`);
 await client.close();
 
+const anonymous = await connect(auth);
+sameTools((await anonymous.listTools()).tools.map((tool) => tool.name), ["whoami"]);
+const anonDoc = JSON.parse(
+  (await anonymous.callTool({ name: "whoami", arguments: {} })).content.find((item) => item.type === "text")?.text ?? "",
+);
+if (anonDoc.login !== null) throw new Error(`whoami without caller identity login ${anonDoc.login}`);
+console.log("no caller identity ok: whoami only");
+await anonymous.close();
+
 const denied = await fetch(url, { method: "POST" });
 if (denied.status !== 401) throw new Error(`missing bearer status ${denied.status}`);
 console.log("bearer required ok");

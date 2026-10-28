@@ -67,16 +67,7 @@ function sameTools(actual, expected) {
   const right = [...expected].sort().join(",");
   if (left !== right) throw new Error(`tool policy ${left} != ${right}`);
 }
-sameTools(allowedTools({ extra: { sub: "shared" } }), [
-  "get_customer",
-  "get_order",
-  "list_customers",
-  "list_orders",
-  "list_products",
-  "search_customers",
-  "search_products",
-  "whoami",
-]);
+sameTools(allowedTools({ extra: { sub: "shared", groups: [] } }), ["whoami"]);
 sameTools(allowedTools({ extra: { groups: ["autogroup:owner", "member"] } }), [
   "get_customer",
   "list_customers",

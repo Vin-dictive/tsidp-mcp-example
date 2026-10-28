@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MCP call inspector</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f5; --panel: #fff; --line: #e2e2dd; --muted: #6b6b66; --text: #1d1d1b;
+    --sel: #eef3ff; --ok: #1f7a3d; --warn: #9a5b00; --bad: #b42318; --ts: #fff7e0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --panel: #1f1f1d; --line: #33332f; --muted: #9a9a93; --text: #ededea;
+      --sel: #23304a; --ok: #5cc985; --warn: #f0b04a; --bad: #ff7b6e; --ts: #3a3218; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+  header { display: flex; gap: 12px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  #status { color: var(--muted); }
+  #status.live { color: var(--ok); }
+  .spacer { flex: 1; }
+  button, select { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); cursor: pointer; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(440px, 55%) 1fr; min-height: 0; }
+  #list td { white-space: nowrap; }
+  #list { overflow: auto; border-right: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; }
+  #list th { position: sticky; top: 0; background: var(--panel); text-align: left; font-weight: 600; color: var(--muted); }
+  th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  #list tbody tr { cursor: pointer; }
+  #list tbody tr:hover { background: var(--sel); }
+  #list tbody tr.selected { background: var(--sel); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid currentColor; white-space: nowrap; }
+  .b-client { color: var(--ok); }
+  .b-serve { color: var(--warn); }
+  .b-none { color: var(--muted); }
+  .s-ok { color: var(--ok); }
+  .s-bad { color: var(--bad); }
+  #detail { overflow: auto; padding: 16px 20px; }
+  #detail h2 { font-size: 14px; margin: 18px 0 8px; }
+  #detail h2:first-child { margin-top: 0; }
+  #detail table td:first-child { color: var(--muted); white-space: nowrap; width: 1%; }
+  tr.ts td { background: var(--ts); }
+  pre { margin: 0; padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  .empty { color: var(--muted); padding: 24px; }
+  .note { color: var(--muted); margin: 4px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MCP call inspector</h1>
+  <span id="status">connecting…</span>
+  <span class="spacer"></span>
+  <label>Show
+    <select id="filter">
+      <option value="all">all calls</option>
+      <option value="with">with identity headers</option>
+      <option value="without">without identity headers</option>
+      <option value="rpc">MCP messages only</option>
+    </select>
+  </label>
+  <button id="clear" type="button">Clear</button>
+</header>
+<main>
+  <section id="list">
+    <table>
+      <thead><tr><th>#</th><th>Time</th><th>Call</th><th>Status</th><th>Listener</th><th>Credential</th><th>Identity headers</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="none" class="empty">No calls yet. Call the MCP server and they appear here.</div>
+  </section>
+  <section id="detail"><div class="empty">Select a call.</div></section>
+</main>
+<script>
+const calls = [];
+let selectedId = null;
+const rows = document.getElementById("rows");
+const detail = document.getElementById("detail");
+const filter = document.getElementById("filter");
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (key === "class") node.className = value;
+    else node.setAttribute(key, value);
+  }
+  for (const child of children) {
+    if (child == null) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function identityBadge(identity) {
+  if (identity.source === "client") return el("span", { class: "badge b-client" }, "sent by caller");
+  if (identity.source === "tailscale-serve") return el("span", { class: "badge b-serve" }, "set by Tailscale Serve");
+  return el("span", { class: "badge b-none" }, "none");
+}
+
+function callLabel(call) {
+  const parts = call.rpc.map((msg) => (msg.tool ? `${msg.method} ${msg.tool}` : msg.method)).filter(Boolean);
+  return parts.length ? parts.join(", ") : `${call.httpMethod} ${call.path}`;
+}
+
+function visible(call) {
+  switch (filter.value) {
+    case "with": return call.identity.present;
+    case "without": return !call.identity.present;
+    case "rpc": return call.rpc.length > 0;
+    default: return true;
+  }
+}
+
+function row(call) {
+  const tr = el("tr", { "data-id": call.id },
+    el("td", { class: "mono" }, call.id),
+    el("td", { class: "mono" }, new Date(call.at).toLocaleTimeString([], { hour12: false })),
+    el("td", { class: "mono" }, callLabel(call)),
+    el("td", { class: `mono ${call.status < 400 ? "s-ok" : "s-bad"}` }, call.status),
+    el("td", {}, call.listener.startsWith("tailnet") ? "direct" : "Serve"),
+    el("td", {}, call.credential.replace(" bearer", "").replace(" token", "")),
+    el("td", {}, identityBadge(call.identity), call.identity.login ? el("div", { class: "mono" }, call.identity.login) : null),
+  );
+  if (call.id === selectedId) tr.classList.add("selected");
+  tr.addEventListener("click", () => select(call.id));
+  return tr;
+}
+
+function renderList() {
+  const shown = calls.filter(visible).reverse();
+  rows.replaceChildren(...shown.map(row));
+  document.getElementById("none").hidden = shown.length > 0;
+}
+
+function kvTable(entries, highlight = () => false) {
+  return el("table", {}, el("tbody", {}, ...entries.map(([key, value]) =>
+    el("tr", highlight(key) ? { class: "ts" } : {}, el("td", { class: "mono" }, key), el("td", { class: "mono" }, value)))));
+}
+
+function pretty(value) {
+  if (value == null || value === "") return el("pre", {}, "(empty)");
+  if (typeof value === "string") {
+    const sseData = value.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim());
+    const payloads = sseData.length ? sseData : [value];
+    try {
+      return el("pre", {}, payloads.map((text) => JSON.stringify(unwrapText(JSON.parse(text)), null, 2)).join("\n\n"));
+    } catch {}
+    return el("pre", {}, value);
+  }
+  return el("pre", {}, JSON.stringify(value, null, 2));
+}
+
+// Tool results carry JSON as a string inside content[].text; show it as an object.
+function unwrapText(message) {
+  const content = message?.result?.content;
+  if (!Array.isArray(content)) return message;
+  return {
+    ...message,
+    result: {
+      ...message.result,
+      content: content.map((item) => {
+        if (item?.type !== "text") return item;
+        try { return { ...item, text: JSON.parse(item.text) }; } catch { return item; }
+      }),
+    },
+  };
+}
+
+function select(id) {
+  selectedId = id;
+  const call = calls.find((item) => item.id === id);
+  for (const tr of rows.children) tr.classList.toggle("selected", Number(tr.dataset.id) === id);
+  if (!call) {
+    detail.replaceChildren(el("div", { class: "empty" }, "Select a call."));
+    return;
+  }
+  const isTs = (name) => name.startsWith("tailscale-");
+  const headers = Object.entries(call.headers).sort(([a], [b]) => (isTs(b) - isTs(a)) || a.localeCompare(b));
+  const identityNote = {
+    client: "These Tailscale-User-* headers arrived exactly as the caller sent them. For Aperture, that is the Caller identity option.",
+    "tailscale-serve": "Tailscale Serve deleted whatever the caller sent and wrote the identity of the device that opened the connection. Through Aperture, that is the Aperture node, not the person.",
+    none: "No Tailscale-User-* headers on this request.",
+  }[call.identity.source];
+  detail.replaceChildren(
+    el("h2", {}, `#${call.id} ${callLabel(call)}`),
+    kvTable([
+      ["time", call.at],
+      ["duration", `${call.durationMs} ms`],
+      ["listener", call.listener],
+      ["remote address", call.remoteAddress ?? ""],
+      ["HTTP", `${call.httpMethod} ${call.path} → ${call.status}`],
+      ["credential", call.credential],
+    ]),
+    el("h2", {}, "Caller identity"),
+    kvTable([
+      ["source", call.identity.source],
+      ["login", call.identity.login ?? "—"],
+      ["name", call.identity.name ?? "—"],
+      ["profile pic", call.identity.profilePic ?? "—"],
+    ]),
+    el("p", { class: "note" }, identityNote),
+    el("h2", {}, "What the server decided"),
+    call.auth
+      ? kvTable([
+          ["sub", call.auth.sub ?? "—"],
+          ["email", call.auth.email ?? "—"],
+          ["groups", call.auth.groups.length ? call.auth.groups.join(", ") : "none"],
+          ["tools", call.auth.tools.join(", ")],
+        ])
+      : el("p", { class: "note" }, "Not authenticated."),
+    el("h2", {}, `Request headers (${headers.length})`),
+    kvTable(headers, isTs),
+    el("h2", {}, "Request body"),
+    pretty(call.body),
+    el("h2", {}, "Response"),
+    pretty(call.response),
+  );
+}
+
+function add(call) {
+  calls.push(call);
+  if (calls.length > 200) calls.shift();
+  if (!visible(call)) return;
+  rows.prepend(row(call));
+  document.getElementById("none").hidden = true;
+}
+
+filter.addEventListener("change", renderList);
+document.getElementById("clear").addEventListener("click", async () => {
+  await fetch("api/clear", { method: "POST" });
+  calls.length = 0;
+  selectedId = null;
+  renderList();
+  select(null);
+});
+
+async function start() {
+  const initial = await (await fetch("api/calls")).json();
+  calls.push(...initial);
+  renderList();
+  const status = document.getElementById("status");
+  const events = new EventSource("api/events");
+  events.onopen = () => { status.textContent = "live"; status.className = "live"; };
+  events.onerror = () => { status.textContent = "disconnected, retrying…"; status.className = ""; };
+  events.onmessage = (event) => add(JSON.parse(event.data));
+}
+start();
+</script>
+</body>
+</html>

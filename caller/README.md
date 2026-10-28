@@ -2,7 +2,7 @@
 
 A second catalog MCP server. It does not use tsidp. One static bearer is the only credential. The Tailscale user comes from the caller identity Aperture sends on each request.
 
-The shop server on port 9933 is separate. `shopshared` and `shopuser` are unchanged.
+The shop server on port 9933 is separate. A flowchart of this path is in [How the shared credential works](../README.md#how-the-shared-credential-works).
 
 ## Start
 
@@ -22,7 +22,7 @@ Do not publish this port with `tailscale serve`. Serve strips incoming `Tailscal
 
 ## Bearer
 
-`0491c3489e91d695184f6a75a1dddbf4155377f68c4eff19`
+`CALLER_TOKEN` in `caller/.env` (copy `example.env`). Generate one with `openssl rand -hex 24`.
 
 Aperture sends it as `Authorization: Bearer`. A request without that exact token gets `401`. The bearer does not choose the tools.
 
@@ -42,7 +42,7 @@ That request had no group header. `groups` is `[]`, and the only tool is `whoami
 
 ## Tool limits
 
-Same group rules as `shopuser`. Orders stay on `shopshared`.
+Same tiers as `shopuser`, from `server/src/access.js`. See [Tool tiers](../README.md#tool-tiers).
 
 | Group | Tools |
 | --- | --- |
@@ -50,15 +50,13 @@ Same group rules as `shopuser`. Orders stay on `shopshared`.
 | `member` | products, plus `whoami` |
 | none | `whoami` only |
 
-A login without a group is not treated as owner, admin, or member. The two people's emails are not listed in this server.
+With Caller identity unticked there is no login, so the result is `whoami` only. With it ticked there is a login but still no group, so the result is the same. A login without a group is not treated as owner, admin, or member. No emails are listed in this server.
 
 ## What has to send the group
 
-The group split does nothing until the caller-identity request also includes the caller's Tailscale group: `owner`, `admin`, or `member` (the `autogroup:` forms of those names count too).
+The group split does nothing until something tells this server the caller's group: `owner`, `admin`, or `member` (the `autogroup:` forms count too).
 
-The headers Aperture sends today do not include it. Tailscale Serve's identity headers do not include it either. tsidp can stamp `groups` only because the tailnet policy in `README-acl.md` copies `autogroup:owner`, `autogroup:admin`, and `autogroup:member` into a userinfo claim. This server never calls tsidp, so that claim does not arrive here.
-
-Aperture has to forward that group on the caller-identity request. After it does, reconnect is not required for the bearer; the next tool call picks up the header.
+The headers Aperture sends do not include it, and neither do Tailscale Serve's. tsidp can stamp `groups` only because the tailnet policy in the [root README](../README.md#tailnet-policy) copies `autogroup:owner`, `autogroup:admin`, and `autogroup:member` into a userinfo claim. This server never calls tsidp, so that claim does not arrive here. The options left are covered in [Can caller identity choose the tools?](../README.md#can-caller-identity-choose-the-tools)
 
 ## Aperture connector
 
@@ -72,7 +70,7 @@ In Aperture on `https://aperture-1.taila6207e.ts.net`, add a connector. The id i
     "description": "Shop catalog by Aperture caller identity",
     "auth": {
       "type": "bearer_token",
-      "secret": "0491c3489e91d695184f6a75a1dddbf4155377f68c4eff19"
+      "secret": "<CALLER_TOKEN>"
     },
     "send_caller_identity": true,
     "provider": "Custom"

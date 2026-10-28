@@ -9,9 +9,15 @@ import { toNodeHandler } from "@modelcontextprotocol/node";
 import * as z from "zod";
 import { allowedTools, groupValues } from "./access.js";
 import { getPool } from "./catalog.js";
+import { createInspector } from "./inspector.js";
 import { registerCatalogTools } from "./tools.js";
 
 const port = Number(process.env.PORT || 9933);
+// Optional second listener on this machine's Tailscale address. Tailscale Serve rewrites
+// Tailscale-User-* headers, so callers that send their own (Aperture's Caller identity) need this path.
+const tailnetBind = process.env.TAILNET_BIND || "";
+const tailnetPort = Number(process.env.TAILNET_PORT || 9935);
+const inspectorPort = Number(process.env.INSPECTOR_PORT || 9934);
 const tsidpUrl = new URL(requiredEnv("TSIDP_URL"));
 const resourceUrl = new URL(requiredEnv("RESOURCE_URL"));
 const scopes = ["openid", "email", "profile"];
@@ -211,8 +217,9 @@ const auth = requireBearerAuth({
 });
 
 const app = createMcpExpressApp({
-  allowedHosts: ["127.0.0.1", "localhost", "mac-muon.taila6207e.ts.net"],
+  allowedHosts: ["127.0.0.1", "localhost", resourceUrl.hostname, ...(tailnetBind ? [tailnetBind] : [])],
 });
+const inspector = createInspector();
 
 function metadata(res, body) {
   res.set("Access-Control-Allow-Origin", "*");
@@ -245,18 +252,31 @@ app.get("/health", async (_req, res) => {
 });
 
 const nodeHandler = toNodeHandler(createMcpHandler(buildServer));
-app.all("/mcp", auth, (req, res) => {
+const listenerFor = (req) => (req.socket.localPort === port ? "localhost (Serve)" : "tailnet direct");
+app.all("/mcp", inspector.record(listenerFor), auth, (req, res) => {
   void nodeHandler(req, res, req.body);
 });
 
-const httpServer = app.listen(port, "127.0.0.1", () => {
+function exitOnError(server) {
+  server.on("error", (err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+exitOnError(app.listen(port, "127.0.0.1", () => {
   console.log(`MCP URL: ${resourceUrl.href}`);
   console.log(`Listening on http://127.0.0.1:${port}/mcp`);
   console.log(`tsidp issuer: ${oauthMetadata.issuer}`);
   console.log(`Protected resource metadata: ${resourceMetadataUrl}`);
-});
+}));
 
-httpServer.on("error", (err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (tailnetBind) {
+  exitOnError(app.listen(tailnetPort, tailnetBind, () => {
+    console.log(`Listening on http://${tailnetBind}:${tailnetPort}/mcp (tailnet direct, headers not rewritten)`);
+  }));
+}
+
+exitOnError(inspector.listen({ host: "127.0.0.1", port: inspectorPort }).on("listening", () => {
+  console.log(`Call inspector: http://127.0.0.1:${inspectorPort}/`);
+}));
