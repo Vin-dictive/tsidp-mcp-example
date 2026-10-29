@@ -227,15 +227,21 @@ Then use `https://mac-muon.taila6207e.ts.net:8443/`. Anyone the tailnet policy l
 
 Browsers cannot open `http://mac-muon.taila6207e.ts.net:9935/` (or any plain `http://` `*.ts.net` URL). `ts.net` is on the HSTS preload list, so the browser switches to HTTPS, and port 9935 only speaks HTTP. Aperture and curl are not browsers and use the 9935 URL fine.
 
-Each request to `/mcp` is one row, including ones that fail auth. For each call it shows:
+The strip at the top lists everyone who has called, with their groups, how many tools they get, and how many requests and tool calls they made. Click a person to show only their calls.
 
-- which listener received it: `Serve` (port 9933) or `direct` (port 9935)
-- the credential: `shared`, `tsidp`, `rejected`, or `none`
-- the JSON-RPC method and tool name, and the HTTP status
-- every request header, with `Tailscale-*` headers highlighted. `Authorization` and `Cookie` show only the scheme and the length
-- the request body, the response, and the `groups` and tools the server chose
+Each request to `/mcp` is one row, including ones that fail auth. The columns:
 
-The identity badge says where the `Tailscale-User-*` headers came from:
+- **User (verified):** the person the server authenticated. For a tsidp token this is the email tsidp vouched for. The shared bearer shows "shared bearer, no user", because it does not identify a person
+- **Groups:** the `groups` claim the server used to pick tools
+- **Call** and **Status:** the JSON-RPC method and tool name, and the HTTP status
+- **Via:** `Serve` (port 9933) or `direct` (port 9935)
+- **Header login (not verified):** the `Tailscale-User-Login` header and where it came from. When it names someone other than the verified user, the row says so
+
+Selecting a row shows the verified user, their groups, and their tools first, then the identity headers, every request header (`Authorization` and `Cookie` show only the scheme and the length), the body, and the response.
+
+Through Serve, the header login on a `shopuser` call is the Aperture node's owner, not the person. For example, Vinnie's calls show `vinay.valson@gmail.com` in the header column, with a note that it differs from the verified user.
+
+The badge in the header column says where the `Tailscale-User-*` headers came from:
 
 | Badge | Meaning |
 | --- | --- |

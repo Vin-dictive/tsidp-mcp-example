@@ -75,6 +75,12 @@ function rpcSummary(body) {
     .filter((msg) => msg.method);
 }
 
+/** The person the server authenticated from the bearer, or null for the shared bearer and failed auth. */
+function verifiedUser(auth) {
+  if (!auth || auth.extra?.sub === "shared") return null;
+  return auth.extra?.email || auth.extra?.username || auth.extra?.sub || null;
+}
+
 function credentialFrom(req) {
   if (!req.headers.authorization) return "none";
   if (!req.auth) return "rejected";
@@ -125,6 +131,8 @@ export function createInspector() {
       const responseText = captureResponse(res);
       res.on("close", () => {
         const auth = req.auth;
+        const identity = identityFrom(req.headers);
+        const user = verifiedUser(auth);
         publish({
           id: nextId++,
           at: new Date(started).toISOString(),
@@ -135,7 +143,11 @@ export function createInspector() {
           path: req.originalUrl,
           status: res.statusCode,
           credential: credentialFrom(req),
-          identity: identityFrom(req.headers),
+          user,
+          identity: {
+            ...identity,
+            mismatch: Boolean(user && identity.login && identity.login.toLowerCase() !== user.toLowerCase()),
+          },
           auth: auth
             ? { sub: auth.extra?.sub ?? null, email: auth.extra?.email ?? null, groups: auth.extra?.groups ?? [], tools: allowedTools(auth) }
             : null,

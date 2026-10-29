@@ -7,11 +7,11 @@
   :root {
     color-scheme: light dark;
     --bg: #f7f7f5; --panel: #fff; --line: #e2e2dd; --muted: #6b6b66; --text: #1d1d1b;
-    --sel: #eef3ff; --ok: #1f7a3d; --warn: #9a5b00; --bad: #b42318; --ts: #fff7e0;
+    --sel: #eef3ff; --ok: #1f7a3d; --warn: #9a5b00; --bad: #b42318; --ts: #fff7e0; --warnbg: #fff1db;
   }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #161615; --panel: #1f1f1d; --line: #33332f; --muted: #9a9a93; --text: #ededea;
-      --sel: #23304a; --ok: #5cc985; --warn: #f0b04a; --bad: #ff7b6e; --ts: #3a3218; }
+      --sel: #23304a; --ok: #5cc985; --warn: #f0b04a; --bad: #ff7b6e; --ts: #3a3218; --warnbg: #3a2a10; }
   }
   * { box-sizing: border-box; }
   body { margin: 0; font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
@@ -21,30 +21,50 @@
   #status.live { color: var(--ok); }
   .spacer { flex: 1; }
   button, select { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); cursor: pointer; }
-  main { flex: 1; display: grid; grid-template-columns: minmax(440px, 55%) 1fr; min-height: 0; }
-  #list td { white-space: nowrap; }
+  #people { display: flex; gap: 8px; flex-wrap: wrap; align-items: stretch; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  #people .label { color: var(--muted); align-self: center; margin-right: 4px; }
+  .person { border: 1px solid var(--line); border-left: 5px solid var(--hue); border-radius: 8px; padding: 6px 10px; background: var(--bg); cursor: pointer; text-align: left; }
+  .person.active { outline: 2px solid var(--hue); }
+  .person .who { font-weight: 600; }
+  .person .meta { color: var(--muted); font-size: 12px; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(480px, 58%) 1fr; min-height: 0; }
   #list { overflow: auto; border-right: 1px solid var(--line); }
+  #list td { white-space: nowrap; }
   table { width: 100%; border-collapse: collapse; }
-  #list th { position: sticky; top: 0; background: var(--panel); text-align: left; font-weight: 600; color: var(--muted); }
+  #list th { position: sticky; top: 0; background: var(--panel); text-align: left; font-weight: 600; color: var(--muted); z-index: 1; }
   th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
   #list tbody tr { cursor: pointer; }
   #list tbody tr:hover { background: var(--sel); }
   #list tbody tr.selected { background: var(--sel); }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .user { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--hue); flex: none; }
+  .nouser { color: var(--muted); font-style: italic; }
   .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid currentColor; white-space: nowrap; }
   .b-client { color: var(--ok); }
   .b-serve { color: var(--warn); }
   .b-none { color: var(--muted); }
+  .b-bad { color: var(--bad); }
   .s-ok { color: var(--ok); }
   .s-bad { color: var(--bad); }
+  .mismatch { color: var(--warn); font-size: 11px; }
   #detail { overflow: auto; padding: 16px 20px; }
-  #detail h2 { font-size: 14px; margin: 18px 0 8px; }
+  #detail h2 { font-size: 14px; margin: 20px 0 8px; }
   #detail h2:first-child { margin-top: 0; }
   #detail table td:first-child { color: var(--muted); white-space: nowrap; width: 1%; }
+  .hero { border: 1px solid var(--line); border-left: 6px solid var(--hue, var(--line)); border-radius: 8px; padding: 12px 14px; background: var(--panel); }
+  .hero .big { font-size: 18px; font-weight: 600; }
+  .hero .sub { color: var(--muted); margin-top: 2px; }
+  .callout { border-radius: 8px; padding: 10px 12px; background: var(--warnbg); margin-top: 8px; }
   tr.ts td { background: var(--ts); }
   pre { margin: 0; padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .empty { color: var(--muted); padding: 24px; }
-  .note { color: var(--muted); margin: 4px 0 0; }
+  .note { color: var(--muted); margin: 6px 0 0; }
+  #detail td { word-break: break-word; }
+  @media (max-width: 1100px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 45% 55%; }
+    #list { border-right: 0; border-bottom: 1px solid var(--line); }
+  }
 </style>
 </head>
 <body>
@@ -55,17 +75,21 @@
   <label>Show
     <select id="filter">
       <option value="all">all calls</option>
+      <option value="tools">tool calls only</option>
+      <option value="rpc">MCP messages only</option>
       <option value="with">with identity headers</option>
       <option value="without">without identity headers</option>
-      <option value="rpc">MCP messages only</option>
     </select>
   </label>
   <button id="clear" type="button">Clear</button>
 </header>
+<section id="people"><span class="label">Who is calling</span><span class="nouser">nobody yet</span></section>
 <main>
   <section id="list">
     <table>
-      <thead><tr><th>#</th><th>Time</th><th>Call</th><th>Status</th><th>Listener</th><th>Credential</th><th>Identity headers</th></tr></thead>
+      <thead><tr>
+        <th>#</th><th>Time</th><th>User (verified)</th><th>Groups</th><th>Call</th><th>Status</th><th>Via</th><th>Header login (not verified)</th>
+      </tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <div id="none" class="empty">No calls yet. Call the MCP server and they appear here.</div>
@@ -75,14 +99,17 @@
 <script>
 const calls = [];
 let selectedId = null;
+let personFilter = null;
 const rows = document.getElementById("rows");
 const detail = document.getElementById("detail");
 const filter = document.getElementById("filter");
+const people = document.getElementById("people");
 
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs)) {
     if (key === "class") node.className = value;
+    else if (key === "style") node.style.cssText = value;
     else node.setAttribute(key, value);
   }
   for (const child of children) {
@@ -92,9 +119,33 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
-function identityBadge(identity) {
+function hueFor(text) {
+  let hash = 0;
+  for (const ch of text) hash = (hash * 31 + ch.codePointAt(0)) >>> 0;
+  return `hsl(${hash % 360} 65% 50%)`;
+}
+
+/** Stable key for grouping calls by who made them. */
+function personKey(call) {
+  if (call.user) return call.user;
+  if (call.credential === "shared bearer") return "shared bearer";
+  return call.credential === "none" ? "no credential" : "rejected";
+}
+
+function personLabel(call) {
+  if (call.user) return el("span", { class: "user", style: `--hue:${hueFor(call.user)}` }, el("span", { class: "dot" }), call.user);
+  if (call.credential === "shared bearer") return el("span", { class: "nouser" }, "shared bearer, no user");
+  return el("span", { class: "badge b-bad" }, call.credential === "none" ? "no credential" : "rejected");
+}
+
+function groupsText(call) {
+  if (!call.auth) return "—";
+  return call.auth.groups.length ? [...call.auth.groups].sort().join(", ") : "none";
+}
+
+function headerBadge(identity) {
   if (identity.source === "client") return el("span", { class: "badge b-client" }, "sent by caller");
-  if (identity.source === "tailscale-serve") return el("span", { class: "badge b-serve" }, "set by Tailscale Serve");
+  if (identity.source === "tailscale-serve") return el("span", { class: "badge b-serve" }, "set by Serve");
   return el("span", { class: "badge b-none" }, "none");
 }
 
@@ -104,33 +155,75 @@ function callLabel(call) {
 }
 
 function visible(call) {
+  if (personFilter && personKey(call) !== personFilter) return false;
   switch (filter.value) {
+    case "tools": return call.rpc.some((msg) => msg.method === "tools/call");
+    case "rpc": return call.rpc.length > 0;
     case "with": return call.identity.present;
     case "without": return !call.identity.present;
-    case "rpc": return call.rpc.length > 0;
     default: return true;
   }
 }
 
 function row(call) {
+  const header = el("td", {}, headerBadge(call.identity));
+  if (call.identity.login) header.append(" ", el("span", { class: "mono" }, call.identity.login));
+  if (call.identity.mismatch) header.append(el("div", { class: "mismatch" }, "differs from the verified user"));
   const tr = el("tr", { "data-id": call.id },
     el("td", { class: "mono" }, call.id),
     el("td", { class: "mono" }, new Date(call.at).toLocaleTimeString([], { hour12: false })),
+    el("td", {}, personLabel(call)),
+    el("td", {}, groupsText(call)),
     el("td", { class: "mono" }, callLabel(call)),
     el("td", { class: `mono ${call.status < 400 ? "s-ok" : "s-bad"}` }, call.status),
     el("td", {}, call.listener.startsWith("tailnet") ? "direct" : "Serve"),
-    el("td", {}, call.credential.replace(" bearer", "").replace(" token", "")),
-    el("td", {}, identityBadge(call.identity), call.identity.login ? el("div", { class: "mono" }, call.identity.login) : null),
+    header,
   );
   if (call.id === selectedId) tr.classList.add("selected");
   tr.addEventListener("click", () => select(call.id));
   return tr;
 }
 
+function renderPeople() {
+  const byPerson = new Map();
+  for (const call of calls) {
+    const key = personKey(call);
+    const entry = byPerson.get(key) ?? { key, sample: call, count: 0, toolCalls: 0, last: call.at };
+    entry.count += 1;
+    if (call.rpc.some((msg) => msg.method === "tools/call")) entry.toolCalls += 1;
+    entry.sample = call;
+    entry.last = call.at;
+    byPerson.set(key, entry);
+  }
+  const chips = [...byPerson.values()].sort((a, b) => b.last.localeCompare(a.last)).map((entry) => {
+    const call = entry.sample;
+    const hue = call.user ? hueFor(call.user) : "var(--line)";
+    const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+    const tools = call.auth ? plural(call.auth.tools.length, "tool") : "no tools";
+    const chip = el("button", { type: "button", class: `person${personFilter === entry.key ? " active" : ""}`, style: `--hue:${hue}` },
+      el("div", { class: "who" }, call.user ?? entry.key),
+      el("div", { class: "meta" }, `groups: ${groupsText(call)} · ${tools}`),
+      el("div", { class: "meta" }, `${plural(entry.count, "request")}, ${plural(entry.toolCalls, "tool call")} · last ${new Date(entry.last).toLocaleTimeString([], { hour12: false })}`),
+    );
+    chip.addEventListener("click", () => {
+      personFilter = personFilter === entry.key ? null : entry.key;
+      renderAll();
+    });
+    return chip;
+  });
+  people.replaceChildren(el("span", { class: "label" }, personFilter ? "Showing one caller (click again for all)" : "Who is calling"),
+    ...(chips.length ? chips : [el("span", { class: "nouser" }, "nobody yet")]));
+}
+
 function renderList() {
   const shown = calls.filter(visible).reverse();
   rows.replaceChildren(...shown.map(row));
   document.getElementById("none").hidden = shown.length > 0;
+}
+
+function renderAll() {
+  renderPeople();
+  renderList();
 }
 
 function kvTable(entries, highlight = () => false) {
@@ -167,6 +260,61 @@ function unwrapText(message) {
   };
 }
 
+function hero(call) {
+  if (call.user) {
+    return el("div", { class: "hero", style: `--hue:${hueFor(call.user)}` },
+      el("div", { class: "big" }, call.user),
+      el("div", { class: "sub" }, "Verified by tsidp: the server checked this bearer token with tsidp, and the email comes from that token."),
+      kvTable([
+        ["groups", groupsText(call)],
+        ["tools allowed", call.auth.tools.join(", ")],
+        ["subject (sub)", call.auth.sub ?? "—"],
+      ]),
+    );
+  }
+  if (call.credential === "shared bearer") {
+    return el("div", { class: "hero" },
+      el("div", { class: "big" }, "No user"),
+      el("div", { class: "sub" }, "Shared bearer: one token for everyone. It proves the caller has the secret, not who the person is."),
+      kvTable([
+        ["groups", groupsText(call)],
+        ["tools allowed", call.auth.tools.join(", ")],
+      ]),
+    );
+  }
+  return el("div", { class: "hero" },
+    el("div", { class: "big" }, call.credential === "none" ? "No credential" : "Rejected"),
+    el("div", { class: "sub" }, call.credential === "none"
+      ? "The request had no Authorization header, so the server answered 401."
+      : "The bearer was neither the shared token nor a token tsidp accepted for this server."),
+  );
+}
+
+function headerSection(call) {
+  const identity = call.identity;
+  const note = {
+    client: "These headers arrived exactly as the caller sent them (Aperture's Caller identity option). The server cannot check them: anyone holding the bearer could send any login.",
+    "tailscale-serve": "Tailscale Serve deleted whatever the caller sent and wrote the owner of the device that opened the connection. Through Aperture, that is the Aperture node's owner for every user.",
+    none: "No Tailscale-User-* headers on this request.",
+  }[identity.source];
+  const parts = [
+    el("h2", {}, "Identity headers (not verified)"),
+    kvTable([
+      ["source", identity.source === "tailscale-serve" ? "set by Tailscale Serve" : identity.source === "client" ? "sent by caller" : "none"],
+      ["login", identity.login ?? "—"],
+      ["name", identity.name ?? "—"],
+      ["profile pic", identity.profilePic ?? "—"],
+    ]),
+    el("p", { class: "note" }, note),
+  ];
+  if (identity.mismatch) {
+    parts.push(el("div", { class: "callout" },
+      `The headers say ${identity.login}, but the token belongs to ${call.user}. The server uses the token. `,
+      identity.source === "tailscale-serve" ? "Serve wrote the Aperture node's owner into the headers." : "The caller sent a login that does not match its token."));
+  }
+  return parts;
+}
+
 function select(id) {
   selectedId = id;
   const call = calls.find((item) => item.id === id);
@@ -177,38 +325,20 @@ function select(id) {
   }
   const isTs = (name) => name.startsWith("tailscale-");
   const headers = Object.entries(call.headers).sort(([a], [b]) => (isTs(b) - isTs(a)) || a.localeCompare(b));
-  const identityNote = {
-    client: "These Tailscale-User-* headers arrived exactly as the caller sent them. For Aperture, that is the Caller identity option.",
-    "tailscale-serve": "Tailscale Serve deleted whatever the caller sent and wrote the identity of the device that opened the connection. Through Aperture, that is the Aperture node, not the person.",
-    none: "No Tailscale-User-* headers on this request.",
-  }[call.identity.source];
   detail.replaceChildren(
     el("h2", {}, `#${call.id} ${callLabel(call)}`),
+    hero(call),
+    ...headerSection(call),
+    el("h2", {}, "Request"),
     kvTable([
       ["time", call.at],
       ["duration", `${call.durationMs} ms`],
-      ["listener", call.listener],
+      ["via", call.listener],
       ["remote address", call.remoteAddress ?? ""],
+      ["x-forwarded-for", call.headers["x-forwarded-for"] ?? "—"],
       ["HTTP", `${call.httpMethod} ${call.path} → ${call.status}`],
       ["credential", call.credential],
     ]),
-    el("h2", {}, "Caller identity"),
-    kvTable([
-      ["source", call.identity.source],
-      ["login", call.identity.login ?? "—"],
-      ["name", call.identity.name ?? "—"],
-      ["profile pic", call.identity.profilePic ?? "—"],
-    ]),
-    el("p", { class: "note" }, identityNote),
-    el("h2", {}, "What the server decided"),
-    call.auth
-      ? kvTable([
-          ["sub", call.auth.sub ?? "—"],
-          ["email", call.auth.email ?? "—"],
-          ["groups", call.auth.groups.length ? call.auth.groups.join(", ") : "none"],
-          ["tools", call.auth.tools.join(", ")],
-        ])
-      : el("p", { class: "note" }, "Not authenticated."),
     el("h2", {}, `Request headers (${headers.length})`),
     kvTable(headers, isTs),
     el("h2", {}, "Request body"),
@@ -221,6 +351,7 @@ function select(id) {
 function add(call) {
   calls.push(call);
   if (calls.length > 200) calls.shift();
+  renderPeople();
   if (!visible(call)) return;
   rows.prepend(row(call));
   document.getElementById("none").hidden = true;
@@ -231,14 +362,15 @@ document.getElementById("clear").addEventListener("click", async () => {
   await fetch("api/clear", { method: "POST" });
   calls.length = 0;
   selectedId = null;
-  renderList();
+  personFilter = null;
+  renderAll();
   select(null);
 });
 
 async function start() {
   const initial = await (await fetch("api/calls")).json();
   calls.push(...initial);
-  renderList();
+  renderAll();
   const status = document.getElementById("status");
   const events = new EventSource("api/events");
   events.onopen = () => { status.textContent = "live"; status.className = "live"; };
