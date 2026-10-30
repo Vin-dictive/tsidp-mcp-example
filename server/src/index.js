@@ -1,4 +1,3 @@
-import { timingSafeEqual } from "node:crypto";
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
 import { createMcpHandler, McpServer, OAuthError, OAuthErrorCode } from "@modelcontextprotocol/server";
 import {
@@ -8,23 +7,19 @@ import {
 } from "@modelcontextprotocol/express";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import * as z from "zod";
-import { allowedTools, groupValues } from "./access.js";
+import { allowedTools, capabilityValues, groupValues } from "./access.js";
 import { getPool } from "./catalog.js";
 import { createInspector } from "./inspector.js";
 import { registerCatalogTools } from "./tools.js";
 
-// The Docker Tailscale sidecar runs in userspace mode, which has no tunnel device.
-// Tailnet calls (tsidp) go through its HTTP proxy. NO_PROXY keeps Postgres direct.
+// The Docker Tailscale sidecar runs in userspace mode, which has no tunnel device,
+// so tailnet calls (tsidp) go through its HTTP proxy. The catalog is a local
+// SQLite file, so nothing else needs to leave the container.
 if (process.env.HTTPS_PROXY || process.env.HTTP_PROXY) {
   setGlobalDispatcher(new EnvHttpProxyAgent());
 }
 
 const port = Number(process.env.PORT || 9933);
-// Second listener for caller-identity headers. On the host this is the Tailscale address,
-// because Tailscale Serve rewrites those headers. In Docker it is 127.0.0.1:9935, and the
-// sidecar forwards tailnet TCP port 9935 there without touching the HTTP headers.
-const tailnetBind = process.env.TAILNET_BIND || "";
-const tailnetPort = Number(process.env.TAILNET_PORT || 9935);
 const inspectorPort = process.env.INSPECTOR_PORT ? Number(process.env.INSPECTOR_PORT) : 0;
 const inspectorHost = process.env.INSPECTOR_HOST || "127.0.0.1";
 const tsidpUrl = new URL(requiredEnv("TSIDP_URL"));
@@ -82,44 +77,31 @@ function audienceValues(aud) {
   return (Array.isArray(aud) ? aud : [aud]).map(String);
 }
 
-function sharedTokenMatches(token) {
-  const expected = process.env.SHARED_TOKEN;
-  if (!expected) return false;
-  const got = Buffer.from(token);
-  const want = Buffer.from(expected);
-  return got.length === want.length && timingSafeEqual(got, want);
-}
-
-async function groupsFromUserInfo(userinfoEndpoint, token) {
-  if (!userinfoEndpoint) return [];
+/**
+ * tsidp only exposes extraClaims on /userinfo, and only when the grant sets
+ * includeInUserInfo. Both claims are read from the same response. Any failure
+ * yields nothing, which leaves the caller on the lowest tier.
+ */
+async function claimsFromUserInfo(userinfoEndpoint, token) {
+  if (!userinfoEndpoint) return { groups: [], capabilities: [] };
   try {
     const response = await fetch(userinfoEndpoint, {
       headers: { authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(8000),
     });
-    if (!response.ok) return [];
+    if (!response.ok) return { groups: [], capabilities: [] };
     const info = await response.json();
-    return groupValues(info.groups);
+    return { groups: groupValues(info.groups), capabilities: groupValues(info.capabilities) };
   } catch (err) {
     const message = err instanceof Error ? err.message : "userinfo failed";
     console.warn(`tsidp userinfo unavailable (${message})`);
-    return [];
+    return { groups: [], capabilities: [] };
   }
 }
 
 function createVerifier(introspectionEndpoint, userinfoEndpoint) {
   return {
     async verifyAccessToken(token) {
-      if (sharedTokenMatches(token)) {
-        return {
-          token,
-          clientId: "shared",
-          scopes: ["openid"],
-          expiresAt: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 365,
-          resource: resourceUrl,
-          extra: { sub: "shared", username: "shared", email: null, groups: [], iss: "shared-credential" },
-        };
-      }
       const body = new URLSearchParams({ token });
       let response;
       try {
@@ -144,7 +126,9 @@ function createVerifier(introspectionEndpoint, userinfoEndpoint) {
       const scopeList = String(info.scope ?? "")
         .split(/\s+/)
         .filter(Boolean);
-      const groups = [...new Set([...groupValues(info.groups), ...(await groupsFromUserInfo(userinfoEndpoint, token))])];
+      const fromUserInfo = await claimsFromUserInfo(userinfoEndpoint, token);
+      const groups = [...new Set([...groupValues(info.groups), ...fromUserInfo.groups])];
+      const capabilities = [...new Set([...groupValues(info.capabilities), ...fromUserInfo.capabilities])];
       return {
         token,
         clientId: String(info.client_id || info.sub || "tsidp"),
@@ -156,6 +140,7 @@ function createVerifier(introspectionEndpoint, userinfoEndpoint) {
           username: info.username ?? null,
           email: info.email ?? null,
           groups,
+          capabilities,
           iss: info.iss ?? null,
         },
       };
@@ -190,7 +175,8 @@ const buildServer = (ctx) => {
   server.registerTool(
     "whoami",
     {
-      description: "Show the Tailscale identity on this token and the catalog tools it can call.",
+      description:
+        "Show the Tailscale identity on this token, its read/write capability, and the catalog tools it can call.",
       inputSchema: z.object({}),
     },
     async () => {
@@ -204,6 +190,9 @@ const buildServer = (ctx) => {
                 scopes: auth.scopes ?? [],
                 expiresAt: auth.expiresAt ?? null,
                 ...(auth.extra ?? {}),
+                // The claim is reported above as tsidp sent it. This is what the
+                // server actually applied, which differs when the claim is absent.
+                capabilities: capabilityValues(auth.extra?.capabilities),
                 tools,
               },
               null,
@@ -226,7 +215,7 @@ const auth = requireBearerAuth({
 });
 
 const app = createMcpExpressApp({
-  allowedHosts: ["127.0.0.1", "localhost", resourceUrl.hostname, ...(tailnetBind ? [tailnetBind] : [])],
+  allowedHosts: ["127.0.0.1", "localhost", resourceUrl.hostname],
 });
 const inspector = inspectorPort ? createInspector() : null;
 
@@ -253,7 +242,7 @@ app.get("/.well-known/oauth-authorization-server", async (_req, res) => {
 
 app.get("/health", async (_req, res) => {
   try {
-    await getPool().query("SELECT 1");
+    getPool().prepare("SELECT 1 AS ok").get();
     res.json({ ok: true });
   } catch {
     res.status(503).json({ ok: false });
@@ -261,11 +250,10 @@ app.get("/health", async (_req, res) => {
 });
 
 const nodeHandler = toNodeHandler(createMcpHandler(buildServer));
-const listenerFor = (req) => (req.socket.localPort === port ? "localhost (Serve)" : "tailnet direct");
 const mcpHandler = (req, res) => {
   void nodeHandler(req, res, req.body);
 };
-if (inspector) app.all("/mcp", inspector.record(listenerFor), auth, mcpHandler);
+if (inspector) app.all("/mcp", inspector.record(), auth, mcpHandler);
 else app.all("/mcp", auth, mcpHandler);
 
 function exitOnError(server) {
@@ -281,12 +269,6 @@ exitOnError(app.listen(port, "127.0.0.1", () => {
   console.log(`tsidp issuer: ${oauthMetadata.issuer}`);
   console.log(`Protected resource metadata: ${resourceMetadataUrl}`);
 }));
-
-if (tailnetBind) {
-  exitOnError(app.listen(tailnetPort, tailnetBind, () => {
-    console.log(`Listening on http://${tailnetBind}:${tailnetPort}/mcp (tailnet direct, headers not rewritten)`);
-  }));
-}
 
 if (inspector) {
   exitOnError(inspector.listen({ host: inspectorHost, port: inspectorPort }).on("listening", () => {

@@ -1,5 +1,12 @@
 node_modules/
 tsidp-state/
 bin/
+.env
 *.crt
 *.key
+
+# Local SQLite catalog, plus the files WAL mode creates alongside it.
+data/
+*.db
+*.db-wal
+*.db-shm

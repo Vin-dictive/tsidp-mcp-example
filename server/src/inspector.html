@@ -88,7 +88,7 @@
   <section id="list">
     <table>
       <thead><tr>
-        <th>#</th><th>Time</th><th>User (verified)</th><th>Groups</th><th>Call</th><th>Status</th><th>Via</th><th>Header login (not verified)</th>
+        <th>#</th><th>Time</th><th>User (verified)</th><th>Groups</th><th>Access</th><th>Call</th><th>Status</th><th>Header login (not verified)</th>
       </tr></thead>
       <tbody id="rows"></tbody>
     </table>
@@ -128,19 +128,28 @@ function hueFor(text) {
 /** Stable key for grouping calls by who made them. */
 function personKey(call) {
   if (call.user) return call.user;
-  if (call.credential === "shared bearer") return "shared bearer";
   return call.credential === "none" ? "no credential" : "rejected";
 }
 
 function personLabel(call) {
   if (call.user) return el("span", { class: "user", style: `--hue:${hueFor(call.user)}` }, el("span", { class: "dot" }), call.user);
-  if (call.credential === "shared bearer") return el("span", { class: "nouser" }, "shared bearer, no user");
   return el("span", { class: "badge b-bad" }, call.credential === "none" ? "no credential" : "rejected");
 }
 
 function groupsText(call) {
   if (!call.auth) return "—";
   return call.auth.groups.length ? [...call.auth.groups].sort().join(", ") : "none";
+}
+
+function capabilitiesText(call) {
+  if (!call.auth) return "—";
+  return [...(call.auth.capabilities ?? [])].sort().join(", ") || "none";
+}
+
+function capabilityBadge(call) {
+  if (!call.auth) return el("span", { class: "badge b-none" }, "—");
+  const canWrite = (call.auth.capabilities ?? []).includes("write");
+  return el("span", { class: `badge ${canWrite ? "b-serve" : "b-client"}` }, canWrite ? "read + write" : "read only");
 }
 
 function headerBadge(identity) {
@@ -174,9 +183,9 @@ function row(call) {
     el("td", { class: "mono" }, new Date(call.at).toLocaleTimeString([], { hour12: false })),
     el("td", {}, personLabel(call)),
     el("td", {}, groupsText(call)),
+    el("td", {}, capabilityBadge(call)),
     el("td", { class: "mono" }, callLabel(call)),
     el("td", { class: `mono ${call.status < 400 ? "s-ok" : "s-bad"}` }, call.status),
-    el("td", {}, call.listener.startsWith("tailnet") ? "direct" : "Serve"),
     header,
   );
   if (call.id === selectedId) tr.classList.add("selected");
@@ -202,7 +211,7 @@ function renderPeople() {
     const tools = call.auth ? plural(call.auth.tools.length, "tool") : "no tools";
     const chip = el("button", { type: "button", class: `person${personFilter === entry.key ? " active" : ""}`, style: `--hue:${hue}` },
       el("div", { class: "who" }, call.user ?? entry.key),
-      el("div", { class: "meta" }, `groups: ${groupsText(call)} · ${tools}`),
+      el("div", { class: "meta" }, `groups: ${groupsText(call)} · ${capabilitiesText(call)} · ${tools}`),
       el("div", { class: "meta" }, `${plural(entry.count, "request")}, ${plural(entry.toolCalls, "tool call")} · last ${new Date(entry.last).toLocaleTimeString([], { hour12: false })}`),
     );
     chip.addEventListener("click", () => {
@@ -267,18 +276,9 @@ function hero(call) {
       el("div", { class: "sub" }, "Verified by tsidp: the server checked this bearer token with tsidp, and the email comes from that token."),
       kvTable([
         ["groups", groupsText(call)],
+        ["capabilities", capabilitiesText(call)],
         ["tools allowed", call.auth.tools.join(", ")],
         ["subject (sub)", call.auth.sub ?? "—"],
-      ]),
-    );
-  }
-  if (call.credential === "shared bearer") {
-    return el("div", { class: "hero" },
-      el("div", { class: "big" }, "No user"),
-      el("div", { class: "sub" }, "Shared bearer: one token for everyone. It proves the caller has the secret, not who the person is."),
-      kvTable([
-        ["groups", groupsText(call)],
-        ["tools allowed", call.auth.tools.join(", ")],
       ]),
     );
   }
@@ -286,7 +286,7 @@ function hero(call) {
     el("div", { class: "big" }, call.credential === "none" ? "No credential" : "Rejected"),
     el("div", { class: "sub" }, call.credential === "none"
       ? "The request had no Authorization header, so the server answered 401."
-      : "The bearer was neither the shared token nor a token tsidp accepted for this server."),
+      : "tsidp did not accept this bearer for this server."),
   );
 }
 
@@ -333,7 +333,6 @@ function select(id) {
     kvTable([
       ["time", call.at],
       ["duration", `${call.durationMs} ms`],
-      ["via", call.listener],
       ["remote address", call.remoteAddress ?? ""],
       ["x-forwarded-for", call.headers["x-forwarded-for"] ?? "—"],
       ["HTTP", `${call.httpMethod} ${call.path} → ${call.status}`],

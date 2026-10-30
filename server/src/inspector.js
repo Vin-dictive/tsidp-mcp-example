@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import express from "express";
-import { allowedTools } from "./access.js";
+import { allowedTools, capabilityValues } from "./access.js";
 
 const MAX_CALLS = 200;
 const MAX_RESPONSE_CHARS = 16_000;
@@ -75,16 +75,15 @@ function rpcSummary(body) {
     .filter((msg) => msg.method);
 }
 
-/** The person the server authenticated from the bearer, or null for the shared bearer and failed auth. */
+/** The person the server authenticated from the bearer, or null when auth failed. */
 function verifiedUser(auth) {
-  if (!auth || auth.extra?.sub === "shared") return null;
+  if (!auth) return null;
   return auth.extra?.email || auth.extra?.username || auth.extra?.sub || null;
 }
 
 function credentialFrom(req) {
   if (!req.headers.authorization) return "none";
-  if (!req.auth) return "rejected";
-  return req.auth.extra?.sub === "shared" ? "shared bearer" : "tsidp token";
+  return req.auth ? "tsidp token" : "rejected";
 }
 
 function captureResponse(res) {
@@ -125,7 +124,7 @@ export function createInspector() {
   }
 
   /** Records every request to the route it is mounted on, including ones auth rejects. */
-  function record(listenerFor) {
+  function record() {
     return (req, res, next) => {
       const started = Date.now();
       const responseText = captureResponse(res);
@@ -137,7 +136,6 @@ export function createInspector() {
           id: nextId++,
           at: new Date(started).toISOString(),
           durationMs: Date.now() - started,
-          listener: listenerFor(req),
           remoteAddress: req.socket.remoteAddress ?? null,
           httpMethod: req.method,
           path: req.originalUrl,
@@ -149,7 +147,13 @@ export function createInspector() {
             mismatch: Boolean(user && identity.login && identity.login.toLowerCase() !== user.toLowerCase()),
           },
           auth: auth
-            ? { sub: auth.extra?.sub ?? null, email: auth.extra?.email ?? null, groups: auth.extra?.groups ?? [], tools: allowedTools(auth) }
+            ? {
+                sub: auth.extra?.sub ?? null,
+                email: auth.extra?.email ?? null,
+                groups: auth.extra?.groups ?? [],
+                capabilities: capabilityValues(auth.extra?.capabilities),
+                tools: allowedTools(auth),
+              }
             : null,
           rpc: rpcSummary(req.body),
           headers: redactHeaders(req.headers),

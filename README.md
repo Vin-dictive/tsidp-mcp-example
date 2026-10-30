@@ -1,331 +1,441 @@
 # tsidp-mcp
 
-A small remote MCP server for a mock coffee-wholesale catalog. Postgres runs in Docker. The MCP endpoint is streamable HTTP. It compares two ways of telling an MCP server who the Tailscale user is:
+A small remote MCP server for a mock coffee-wholesale catalog, behind
+[tsidp](https://github.com/tailscale/tsidp) — Tailscale's OIDC identity provider.
+The catalog is a SQLite file, so there is no database service to run. The MCP
+endpoint is streamable HTTP.
 
-1. **Shared credential.** One static bearer for everyone, sent by Aperture. With the connector's **Caller identity** box ticked, Aperture also forwards the caller's login, name, and picture as headers.
-2. **Per-user token from [tsidp](https://github.com/tailscale/tsidp).** Tailscale's OIDC identity provider issues each user their own token, and the tailnet policy stamps a `groups` claim on it.
+Every caller presents a per-user tsidp token. The MCP server introspects that
+token with tsidp and reads two claims from it, which the tailnet policy stamps:
 
-Only the second one gives the MCP server a group it can use to choose tools. See [Can caller identity choose the tools?](#can-caller-identity-choose-the-tools)
+| Claim | Decides | Example |
+| --- | --- | --- |
+| `groups` | which **data domains** the caller sees | `["owner"]` → customers, products, orders |
+| `capabilities` | whether they **read or also write** in those domains | `["read","write"]` |
 
-Tailnet: `taila6207e.ts.net`. This Mac is `mac-muon`.
+Neither claim is listed anywhere in the server. No logins, groups, or emails are
+hardcoded, and the server holds no Tailscale admin credential.
 
-| Connector | URL | Credential | Tools |
-| --- | --- | --- | --- |
-| `shopshared` | `https://mac-muon.taila6207e.ts.net/mcp` (Serve), or `http://mac-muon.taila6207e.ts.net:9935/mcp` (direct) to see Caller identity headers | `SHARED_TOKEN` | `whoami` |
-| `shopuser` | `https://mac-muon.taila6207e.ts.net/mcp` (Serve) | per-user tsidp token | by `groups` claim, see [Tool tiers](#tool-tiers) |
+> Replace `<tailnet>` below with your own tailnet name (the `*.ts.net` name shown
+> at <https://login.tailscale.com/admin/dns>). Node names come from `.env`.
 
-The names in the rest of this document are this tailnet. To run the same stack on yours, follow [Run on your tailnet](#run-on-your-tailnet).
-
-## How the shared credential works
-
-```mermaid
-flowchart TD
-  user["Tailscale user in Aperture Chat or an agent"] --> aperture["Aperture gateway"]
-  aperture --> grant{"Aperture grant for this connector?"}
-  grant -- no --> denied["Denied by Aperture"]
-  grant -- yes --> ticked{"Caller identity ticked?"}
-  ticked -- no --> plain["Authorization: Bearer SHARED_TOKEN"]
-  ticked -- yes --> headers["Bearer plus Tailscale-User-Login, Tailscale-User-Name, Tailscale-User-Profile-Pic"]
-  plain --> url{"Connector URL"}
-  headers --> url
-
-  url -- Serve URL, https on 443 --> serve["tailscale serve on mac-muon"]
-  serve --> strip["Serve deletes incoming Tailscale-User-* headers, then sets the identity of the device that connected, which is the Aperture node"]
-  strip --> local["server/ on 127.0.0.1:9933"]
-
-  url -- direct URL, http on 9935 --> direct["server/ on TAILNET_BIND:9935. Headers arrive as Aperture sent them"]
-
-  local --> sharedok{"Bearer equals SHARED_TOKEN?"}
-  direct --> sharedok
-  sharedok -- no --> introspect["Treated as a tsidp token, see the per-user flow"]
-  sharedok -- yes --> sharedtools["sub = shared, groups = none: whoami only. The Tailscale-User-* headers do not change the tools"]
-```
-
-The bearer proves the request came through Aperture (or from anyone else holding the bearer). It does not say who the user is. The headers say who the user is, but the MCP server cannot verify them: anyone who can reach port 9935 with the bearer can send any login.
-
-## How the per-user tsidp token works
+## How a call is authorized
 
 ```mermaid
 flowchart TD
-  connect["User selects Connect on shopuser in Aperture Chat, from an untagged device"] --> dcr["Aperture registers a client at tsidp /register"]
-  dcr --> dcrgrant{"Aperture node has allow_dcr in tailscale.com/cap/tsidp?"}
+  connect["User selects Connect on the connector, from an untagged device"] --> dcr["Client registers at tsidp /register"]
+  dcr --> dcrgrant{"Caller has allow_dcr in tailscale.com/cap/tsidp?"}
   dcrgrant -- no --> dcrdeny["Registration denied"]
   dcrgrant -- yes --> authorize["Browser goes to tsidp /authorize"]
   authorize --> tagged{"Browser device tagged?"}
   tagged -- yes --> tagdeny["tagged node doesn't have a user identity"]
   tagged -- no --> whois["tsidp runs WhoIs on the browser's device and stores that user and their grants"]
-  whois --> claims["Grants for autogroup:owner, admin, member add extraClaims groups to userinfo"]
-  claims --> token["Token issued for resource https://mac-muon.taila6207e.ts.net/mcp. Aperture stores it for this user only"]
+  whois --> claims["Grants add extraClaims groups and capabilities to userinfo"]
+  claims --> token["Token issued for resource SHOP_RESOURCE_URL"]
   token --> toolcall["Tool call: Authorization: Bearer user token"]
-  toolcall --> serve["tailscale serve, then server/ on 127.0.0.1:9933"]
+  toolcall --> serve["Tailscale Serve on the shop node, then the server on 127.0.0.1:9933"]
   serve --> intro["POST tsidp /introspect: active, aud equals RESOURCE_URL"]
   intro -- inactive or wrong audience --> u401["401"]
-  intro -- ok --> userinfo["GET tsidp /userinfo: read groups"]
-  userinfo --> tier{"groups"}
-  tier -- owner or admin --> admin["customers, products, whoami"]
-  tier -- member --> member["products, whoami"]
-  tier -- none --> notier["whoami"]
+  intro -- ok --> userinfo["GET tsidp /userinfo: read groups and capabilities"]
+  userinfo --> domains{"groups"}
+  domains -- owner or admin --> d1["customers, products, orders"]
+  domains -- member --> d2["products"]
+  domains -- none --> d3["no data domains, whoami only"]
+  d1 --> caps{"capabilities"}
+  d2 --> caps
+  caps -- read --> readonly["read tools in those domains"]
+  caps -- read + write --> readwrite["read tools plus write tools"]
 ```
-
-The group comes from the tailnet policy and travels inside a token that the MCP server checks with tsidp. No logins or groups are listed in the server.
 
 ## Tool tiers
 
-From `server/src/access.js`.
+`groups` picks the rows, `capabilities` picks the columns. From
+`server/src/access.js`.
 
-| `groups` value | Tools |
-| --- | --- |
-| `owner` or `admin` (or the `autogroup:` forms) | `list_customers`, `get_customer`, `search_customers`, `list_products`, `search_products`, `whoami` |
-| `member` | `list_products`, `search_products`, `whoami` |
-| none, or the shared bearer | `whoami` |
+| `groups` | Domains | `read` (or no claim) | adds with `write` |
+| --- | --- | --- | --- |
+| `owner`, `admin` (or `autogroup:` forms) | customers, products, orders | `list_customers`, `get_customer`, `search_customers`, `list_products`, `search_products`, `list_orders`, `get_order` | `update_customer`, `upsert_product`, `create_order`, `update_order_status` |
+| `member` (or `autogroup:member`) | products | `list_products`, `search_products` | `upsert_product` |
+| none | none | — | — |
 
-When both `owner`/`admin` and `member` are present, `owner` or `admin` wins. `list_orders` and `get_order` exist in `server/src/tools.js` but no tier grants them.
+`whoami` is always available to any valid token. When both `owner`/`admin` and
+`member` match, the wider tier wins.
 
-## Can caller identity choose the tools?
+Two rules worth stating plainly:
 
-Not by itself. Ticking **Caller identity** (`send_caller_identity`) makes Aperture forward three headers, and none of them is a group:
+- **A token with no `capabilities` claim reads.** Writing is never implicit, so
+  an unchanged tailnet policy cannot start writing after an upgrade.
+- **`write` alone does not grant the read tools.** The claim is taken literally:
+  `["write"]` on a `member` yields `upsert_product` and `whoami` only. Grant
+  `["read","write"]` for the usual case.
 
-| Header | Example |
-| --- | --- |
-| `Tailscale-User-Login` | `vinay.valson@gmail.com` |
-| `Tailscale-User-Name` | `Vinay Valson` |
-| `Tailscale-User-Profile-Pic` | profile image URL |
+Tool filtering happens at registration, per request. A tool a caller may not use
+is never registered on that caller's server instance, so calling it by name
+fails rather than being merely hidden from `tools/list`.
 
-A live request from `aperture-1` (`100.109.60.70`) to this Mac carried exactly these. They are the same three that [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve#identity-headers) sets. To pick tools by group from a login, the MCP server would need one of these:
+### Read and write use different database handles
 
-- **A login-to-group table in the server.** This is hardcoding, and it drifts from the tailnet policy.
-- **A Tailscale API lookup per caller.** This needs an OAuth client with `users:read` for the role (owner, admin, member) and `policy_file:read` for `group:` members, stored on the MCP host. That is an admin-scoped secret in the MCP server, plus a network call on every new caller.
+`server/src/catalog.js` opens the same file twice:
 
-Either way the login is still unsigned, so whoever holds the bearer can claim any login.
-
-Aperture can filter by group, but at the gateway rather than in the MCP server. Add the [`tailscale.com/visible-groups`](https://tailscale.com/docs/aperture/visible-groups) node attribute for the Aperture node, then use [`connectors` grants](https://tailscale.com/docs/aperture/how-to/grant-mcp-tool-access) such as `"shopshared/tools/list_products"` with a `group:` `src`. The upstream still sees one credential and has to return every tool, so that only works if the bearer gets the full set and every client goes through Aperture. Cursor pointed straight at the server would get the full set.
-
-With tsidp, the group is a claim on a per-user token that the server introspects. It works for any MCP client, including Cursor without Aperture, and the server holds no Tailscale admin credential.
-
-## Run on your tailnet
-
-`docker compose up -d` starts four services:
-
-| Service | Where it lives | What it is |
+| Handle | Opened with | Used by |
 | --- | --- | --- |
-| `tsidp` | its own tailnet node, `idp.<tailnet>.ts.net` | Tailscale's OIDC provider |
-| `ts-shop` | its own tailnet node, `shop-mcp.<tailnet>.ts.net` | Tailscale, in userspace mode. No `/dev/net/tun`, so it runs on Docker Desktop |
-| `shop` | shares `ts-shop`'s network | the MCP server |
-| `db` | the Compose network only | Postgres. Other containers reach it as `db:5432`. It has no tailnet address. The host can reach it at `127.0.0.1:54329` |
+| reader | `new DatabaseSync(path, { readOnly: true })` | every read tool |
+| writer | `new DatabaseSync(path)` | the four write tools only |
 
-The sidecar publishes two ports on the shop node:
+SQLite refuses any write on the read-only handle — it raises *"attempt to write
+a readonly database"* — so a bug in a read tool cannot modify data even when it
+is reached with a write caller's token. `npm run verify` asserts this directly.
 
-| Port | Mode | URL |
+This is a weaker guarantee than the Postgres roles it replaced. It is enforced
+**inside the process**, not by the database: anything with filesystem access to
+`shop.db` can still write to it. The schema is applied from
+`server/src/schema.sql` the first time the file is opened.
+
+## Prerequisites
+
+1. **Docker.**
+2. **MagicDNS and HTTPS certificates, both enabled**, at
+   <https://login.tailscale.com/admin/dns>. This is required, not optional:
+   - MagicDNS is what makes `idp.<tailnet>.ts.net` and
+     `shop-mcp.<tailnet>.ts.net` resolve at all.
+   - HTTPS certificates are what let Tailscale Serve terminate TLS on those
+     names. Without them the shop node cannot serve `https://`, tsidp cannot
+     issue an issuer URL the MCP server will accept, and every discovery fetch
+     fails.
+
+   Turn both on **before** the first `docker compose up`. Enabling them later
+   means re-registering the nodes to pick up certificates.
+3. **Both tags defined in `tagOwners`, and an OAuth client that holds them** —
+   see [Tags and one auth key](#tags-and-one-auth-key). Registration fails if
+   either is missing, and the client's tags cannot be changed afterwards.
+4. An MCP client that speaks OAuth, and a tailnet user to connect as.
+
+## Tags and one auth key
+
+Both nodes are tagged, so they are server identities rather than someone's
+personal devices, and their keys do not expire:
+
+| Service | Node | Tag |
 | --- | --- | --- |
-| 443 | HTTPS Serve. Rewrites `Tailscale-User-*` headers | `https://shop-mcp.<tailnet>.ts.net/mcp` |
-| 9935 | raw TCP forward to the server. Headers arrive unchanged | `http://shop-mcp.<tailnet>.ts.net:9935/mcp` |
-| 8443 | HTTPS Serve, the call inspector | `https://shop-mcp.<tailnet>.ts.net:8443/` |
+| `tsidp` | `idp.<tailnet>.ts.net` | `${TSIDP_TAG}`, default `tag:tsidp` |
+| `ts-shop` | `shop-mcp.<tailnet>.ts.net` | `${MCP_TAG}`, default `tag:mcpserver` |
 
-The server reaches tsidp through the sidecar's HTTP proxy, because userspace mode has no tunnel interface. Postgres is excluded from that proxy.
+Add both to the policy before first start:
 
-### Before the first start
-
-1. Docker, and a tailnet with MagicDNS and HTTPS certificates turned on at <https://login.tailscale.com/admin/dns>.
-2. An Aperture gateway on that tailnet, if you want the two connectors.
-3. Copy the env file and fill it in. Passwords must not contain `@`, `:`, `/`, or a space.
-
-   ```bash
-   cp example.env .env
-   ```
-
-   `TSIDP_URL` is `https://idp.<tailnet>.ts.net`. `SHOP_RESOURCE_URL` is `https://shop-mcp.<tailnet>.ts.net/mcp`. Generate `SHARED_TOKEN` with `openssl rand -hex 24`.
-
-   `TS_AUTHKEY` is optional. An auth key from <https://login.tailscale.com/admin/settings/keys> lets `ts-shop` join on its own. Leave it empty to approve a login URL instead. Do not commit a real key.
-
-### Start
-
-```bash
-docker compose up -d --build
-docker compose logs -f tsidp ts-shop
+```hujson
+"tagOwners": {
+  "tag:tsidp":     ["autogroup:admin"],
+  "tag:mcpserver": ["autogroup:admin"],
+},
 ```
 
-Each of those two containers prints a `https://login.tailscale.com/a/...` URL the first time, unless `TS_AUTHKEY` is set. Approve both. `tsidp` becomes `idp`, and `ts-shop` becomes `shop-mcp`. HTTPS for the new names can take a minute.
+**One credential covers both.** Use an **OAuth client**, not a plain auth key:
+create one at <https://login.tailscale.com/admin/settings/oauth> with the
+`auth_keys` write scope and both tags, then set a single value in `.env`:
 
 ```bash
-curl -4sS https://idp.<tailnet>.ts.net/.well-known/openid-configuration
-curl -4sS -o /dev/null -w "%{http_code}\n" https://shop-mcp.<tailnet>.ts.net/mcp
+TS_AUTHKEY=tskey-client-xxxxxxxxxxxx?ephemeral=false
 ```
 
-The second command returns `401`. That is the MCP server answering.
+Each node then mints its own key carrying only its own tag. `?ephemeral=false`
+keeps the nodes after a restart.
 
-The database init scripts run only when the data volume is first created. `docker compose down -v` deletes that volume, the tsidp node state, and the shop node state.
+**The client's tags are fixed at creation and cannot be edited.** A node may only
+request a tag the client already holds, so a client created with just one tag
+fails for the other node — see
+[requested tags are invalid or not permitted](#requested-tags-are-invalid-or-not-permitted).
 
-### Tailnet policy
+If you would rather not re-create the client each time you add a node, give it a
+single owner tag instead of listing every node tag:
 
-In the [grants below](#all-four-grants), change two things:
+```hujson
+"tagOwners": {
+  "tag:mcp-deploy": ["autogroup:admin"],
+  "tag:tsidp":      ["tag:mcp-deploy"],
+  "tag:mcpserver":  ["tag:mcp-deploy"],
+},
+```
 
-- `resources` becomes your `SHOP_RESOURCE_URL`, character for character. tsidp checks it when it issues a token.
-- The `allow_dcr` grant's `src` becomes the login of the Aperture node on your tailnet. tsidp denies `/register` to anyone else.
+Create the client with **only** `tag:mcp-deploy`. It can then mint keys for
+either child tag, and a new node needs a `tagOwners` line rather than a new
+client.
 
-The `autogroup` grants need no names from your tailnet. They stamp `groups` onto whoever connects.
+This works because the two services take their tag by different routes, and both
+routes are driven from that one secret:
 
-Aperture also needs its own grants for `shopshared/**` and `shopuser/**`. Those live in the Aperture configuration, not in the tailnet policy.
-
-Connect `shopuser` from an untagged device. tsidp rejects `/authorize` from a tagged node with `tagged node doesn't have a user identity`.
-
-### Aperture
-
-| Connector | URL | Caller identity |
+| Service | How it gets its tag | Why |
 | --- | --- | --- |
-| `shopuser` | `https://shop-mcp.<tailnet>.ts.net/mcp` | leave unticked. The per-user token carries the identity |
-| `shopshared` | `http://shop-mcp.<tailnet>.ts.net:9935/mcp` | ticked, when you want the caller's login in the headers |
+| `tsidp` | `TS_ADVERTISE_TAGS` | it is a **tsnet** app, so there is no `tailscale up` to pass flags to. tsidp's own `-advertise-tags` flag reads this, and its help text notes it is required with OAuth client secrets |
+| `ts-shop` | `TS_EXTRA_ARGS=--advertise-tags=…` | it runs real `tailscaled`, so the flag goes to `tailscale up` |
 
-`shopshared` on port 443 shows the Aperture node's owner in the headers, whichever person is chatting. Port 9935 shows the person. Neither header changes the tools: the shared bearer gets `whoami` only.
+**A plain `tskey-auth-` key cannot do this.** Tags on an auth key are
+authoritative: one key holding both tags puts *both* tags on *both* nodes, and
+asking for a subset with `--advertise-tags` only works if you add self-ownership
+to `tagOwners`. If you would rather use plain keys, generate one per tag, keep
+`TS_AUTHKEY` for tsidp, add `TS_AUTHKEY_SHOP` to `.env`, and point the `ts-shop`
+service at it in `docker-compose.yml`.
 
-## Start the database
+### TSNET_FORCE_LOGIN
 
-```bash
-cd ~/Projects/tsidp-mcp
-docker compose up -d db
-```
+The `tsidp` service sets `TSNET_FORCE_LOGIN=1`. tsnet **ignores `TS_AUTHKEY`
+whenever its state directory already holds a logged-in node** — it logs
+`Authkey is set; but state is …. Ignoring authkey. Re-run with
+TSNET_FORCE_LOGIN=1 to force use of authkey.` Since `/data` persists in the
+`tsidp-data` volume, a tag added later would never take effect without this:
+the node would quietly keep its old untagged identity.
 
-Postgres listens on `127.0.0.1:54329`. The MCP role `mcp_reader` can only `SELECT`. Seed data is customers, products, orders, and order items (Northwind Cafe, Harbor & Rye, and so on).
-
-## Start tsidp
-
-tsidp is a separate tailnet node, which is the setup in the current [tsidp README](https://github.com/tailscale/tsidp). No auth key is stored here. On first start the container prints a Tailscale login URL.
-
-```bash
-docker compose up -d tsidp
-docker compose logs -f tsidp
-```
-
-Open the `https://login.tailscale.com/a/...` URL and approve the node. Its name is `idp`, so the issuer is:
-
-`https://idp.taila6207e.ts.net`
-
-HTTPS for that name can take a minute after approval. Check:
-
-```bash
-curl -4sS https://idp.taila6207e.ts.net/.well-known/openid-configuration
-```
+It pairs with an auth key. With a valid key, every start re-authenticates
+silently. Without one, each start prints a fresh login URL to approve.
 
 ## Tailnet policy
 
-Edit the policy at <https://login.tailscale.com/admin/acls>. Add the grants below to the existing `grants` array. Nothing else in the policy changes.
+Edit at <https://login.tailscale.com/admin/acls>. Alongside the `tagOwners`
+above, add these grants. Change two things:
 
-The MCP resource URL is `https://mac-muon.taila6207e.ts.net/mcp`. `resources` has to match that string exactly. tsidp checks it when a token is issued for this server.
+- `resources` becomes your `SHOP_RESOURCE_URL`, character for character. tsidp
+  checks it when it issues a token, and the MCP server rejects a token whose
+  audience does not match.
+- The `allow_dcr` grant's `src` becomes the login (or group) allowed to register
+  a client. tsidp denies `/register` to anyone else.
 
-### Dynamic client registration
-
-tsidp denies `/register` unless the caller has `tailscale.com/cap/tsidp` with `allow_dcr` true. Aperture's `shopuser` connector registers from the Aperture node, which is logged in as `vinay.valson@gmail.com`. This Mac is tagged, so a register call from here is a different identity.
-
-`users` is which logins may be the subject of a token for those resources. `["*"]` allows any tailnet user.
-
-### Group claim
-
-tsidp does not copy Tailscale groups onto a token by itself. The last three grants stamp a `groups` claim from the caller's autogroup, and only when `includeInUserInfo` is true. The MCP server reads `groups` from `https://idp.taila6207e.ts.net/userinfo`.
-
-`autogroup:admin` is the Admin role only. The Owner role is `autogroup:owner`, so the owner grant is what gives that account the broader tool set. `autogroup:member` includes every direct member, including owners and admins.
-
-The claim is taken from the WhoIs snapshot stored when the user finishes Connect. After changing these grants, each person connects `shopuser` again and refreshes tools. `whoami` shows the `groups` array on that token.
-
-### All four grants
+The `autogroup:` grants need no names from your tailnet. They stamp `groups` and
+`capabilities` onto whoever connects. Both claims need `includeInUserInfo: true`
+— tsidp exposes extraClaims only on `/userinfo`, which is where the server reads
+them.
 
 ```hujson
 "grants": [
   {
-    "src": ["vinay.valson@gmail.com"],
+    // Dynamic client registration.
+    "src": ["autogroup:admin"],
     "dst": ["*"],
     "app": {
       "tailscale.com/cap/tsidp": [
         {
           "allow_dcr": true,
           "users": ["*"],
-          "resources": ["https://mac-muon.taila6207e.ts.net/mcp"]
+          "resources": ["https://shop-mcp.<tailnet>.ts.net/mcp"]
         }
       ]
     }
   },
   {
+    // Owner: every domain, and may write.
     "src": ["autogroup:owner"],
     "dst": ["*"],
     "app": {
       "tailscale.com/cap/tsidp": [{
         "includeInUserInfo": true,
-        "extraClaims": { "groups": ["owner"] }
+        "extraClaims": {
+          "groups": ["owner"],
+          "capabilities": ["read", "write"]
+        }
       }]
     }
   },
   {
+    // Admin: every domain, read only. Add "write" here to let admins write too.
     "src": ["autogroup:admin"],
     "dst": ["*"],
     "app": {
       "tailscale.com/cap/tsidp": [{
         "includeInUserInfo": true,
-        "extraClaims": { "groups": ["admin"] }
+        "extraClaims": {
+          "groups": ["admin"],
+          "capabilities": ["read"]
+        }
       }]
     }
   },
   {
+    // Member: products only, read only.
     "src": ["autogroup:member"],
     "dst": ["*"],
     "app": {
       "tailscale.com/cap/tsidp": [{
         "includeInUserInfo": true,
-        "extraClaims": { "groups": ["member"] }
+        "extraClaims": {
+          "groups": ["member"],
+          "capabilities": ["read"]
+        }
       }]
     }
   }
 ]
 ```
 
-Aperture connector grants (`shopshared/**`, `shopuser/**`) are set in the Aperture configuration, not in this tailnet policy.
+`autogroup:admin` is the Admin role only; the Owner role is `autogroup:owner`.
+`autogroup:member` includes every direct member, owners and admins included —
+which is why the wider tier wins when several match.
 
-## Start the MCP server
+Claims come from the WhoIs snapshot taken when the user finishes Connect. After
+changing these grants, each person connects again and refreshes their tools.
+`whoami` shows the `groups` and `capabilities` on the current token.
 
-The Compose file starts it. See [Run on your tailnet](#run-on-your-tailnet).
+Note that `capabilities` is an ordinary extraClaim, not something tsidp knows
+about. Naming it something else means changing only `server/src/access.js` and
+`server/src/index.js`.
+
+## Run
+
+`docker compose up -d` starts three services:
+
+| Service | Where it lives | What it is |
+| --- | --- | --- |
+| `tsidp` | own tailnet node, `idp.<tailnet>.ts.net`, `tag:tsidp` | Tailscale's OIDC provider |
+| `ts-shop` | own tailnet node, `shop-mcp.<tailnet>.ts.net`, `tag:mcpserver` | Tailscale in userspace mode. No `/dev/net/tun`, so it runs on Docker Desktop |
+| `shop` | shares `ts-shop`'s network | the MCP server, with the catalog at `/data/shop.db` on the `shop-data` volume |
+
+The sidecar publishes two ports on the shop node:
+
+| Port | Mode | URL |
+| --- | --- | --- |
+| 443 | HTTPS Serve | `https://shop-mcp.<tailnet>.ts.net/mcp` |
+| 8443 | HTTPS Serve, the call inspector | `https://shop-mcp.<tailnet>.ts.net:8443/` |
+
+The server reaches tsidp through the sidecar's HTTP proxy, because userspace
+mode has no tunnel interface. Nothing else leaves the container — the catalog is
+a local file.
+
+### First start
 
 ```bash
-docker compose up -d --build shop
+cp example.env .env
 ```
 
-To run it on the host instead, for development:
+Fill in `.env`. `TSIDP_URL` is `https://idp.<tailnet>.ts.net` and
+`SHOP_RESOURCE_URL` is `https://shop-mcp.<tailnet>.ts.net/mcp`. There are no
+database credentials to set.
 
 ```bash
-cd ~/Projects/tsidp-mcp/server
+docker compose up -d --build
+docker compose logs -f tsidp ts-shop
+```
+
+With `TS_AUTHKEY` set, both nodes register themselves. Without it, each prints a
+`https://login.tailscale.com/a/...` URL to approve. HTTPS for the new names can
+take a minute.
+
+```bash
+curl -4sS https://idp.<tailnet>.ts.net/.well-known/openid-configuration
+curl -4sS -o /dev/null -w "%{http_code}\n" https://shop-mcp.<tailnet>.ts.net/mcp
+```
+
+The second returns `401`. That is the MCP server answering.
+
+Connect from an **untagged** device. The server nodes are tagged, which is fine,
+but tsidp rejects `/authorize` from a tagged *client* with `tagged node doesn't
+have a user identity` — it has no user to run WhoIs against.
+
+The catalog is created and seeded the first time the server opens
+`/data/shop.db`. `docker compose down -v` deletes it along with both nodes'
+state; the next start seeds a fresh copy.
+
+## Call inspector
+
+`https://shop-mcp.<tailnet>.ts.net:8443/` shows each MCP call live: the verified
+user, their `groups` and `capabilities`, the tools that identity may call, the
+`Tailscale-User-*` headers, and the full request and response.
+
+> **The inspector has no authentication, and Serve publishes it to your whole
+> tailnet.** Anyone who can reach the shop node can read it — including people
+> with no grant for this MCP server at all, and tagged nodes that can never hold
+> a token. It captures tool *responses*, so customer names, emails and order
+> history from an owner's calls become readable by any tailnet device, which
+> bypasses the tool tiers above for reading. It also exposes the login, email
+> and groups of everyone who has used the server, and `POST /api/clear` wipes
+> the record without authentication.
+>
+> Treat it as a development tool on a tailnet you trust. To close the exposure,
+> remove the `8443` entries from `ts-shop/serve.json` and reach it through
+> `docker compose exec` or an SSH port-forward instead. On the 8443 Serve path
+> `Tailscale-User-Login` *is* trustworthy — Serve deletes any client-sent copy
+> and writes the connecting device's identity — so gating the inspector on an
+> allowlist of logins is a sound fix if you want to keep it published.
+
+Records are capped at 200 calls, held in memory only, and never written to disk.
+`Authorization`, `Cookie` and `Proxy-Authorization` are redacted.
+
+## Development
+
+```bash
+cd server
 npm install
 npm start
 ```
 
-`npm run verify` checks the seed data, the tool list, and the tool tiers against the database at `127.0.0.1:54329`. The host process listens on `127.0.0.1:9933`. With `TAILNET_BIND` set to this machine's `tailscale ip -4`, it also listens on that address at `TAILNET_PORT`, and nothing rewrites headers there. Do not publish that port with `tailscale serve`, or Serve will rewrite them. The container does not need `TAILNET_BIND`: its sidecar forwards tailnet port 9935 to `127.0.0.1:9935` as raw TCP.
+Requires **Node 24+**: the catalog uses the built-in `node:sqlite`, which is a
+release candidate there and needs no flag. There is no database driver
+dependency.
 
-Browsers cannot open `http://mac-muon.taila6207e.ts.net:9935/` (or any plain `http://` `*.ts.net` URL). `ts.net` is on the HSTS preload list, so the browser switches to HTTPS, and port 9935 only speaks HTTP. Aperture and curl are not browsers and use the 9935 URL fine.
+`npm run verify` needs nothing running at all — it seeds a throwaway database
+in a temp directory, then checks the seed data, the tool list, the whole
+group × capability matrix, every write tool, and that the read-only handle
+really does refuse writes. The host process listens on `127.0.0.1:9933` and
+keeps its catalog wherever `DATABASE_PATH` points (`./data/shop.db` by default).
 
-### Compare Caller identity on and off
+Inspect the data with the `sqlite3` CLI:
 
-On the Compose service the direct URL is already `http://<shop-hostname>.<tailnet>.ts.net:9935/mcp`. The steps below are the host-run server on this machine.
+```bash
+sqlite3 server/data/shop.db 'SELECT * FROM orders ORDER BY id DESC LIMIT 5;'
+```
 
-1. Set `TAILNET_BIND` to this machine's Tailscale address in `.env` and restart. The log prints `Listening on http://<tailscale-ip>:9935/mcp`.
-2. In Aperture, set the `shopshared` URL to the direct listener. `send_caller_identity` only accepts a MagicDNS name or a Tailscale IP, and this URL is a MagicDNS name.
+`scripts/tsidp.sh` runs tsidp against an existing local `tailscaled` instead of
+its own tsnet node; it is only useful for hacking on tsidp itself, and the node
+running it must be untagged.
 
-   ```json
-   {
-     "shopshared": {
-       "protocol": "mcp",
-       "url": "http://mac-muon.taila6207e.ts.net:9935/mcp",
-       "auth": { "type": "bearer_token", "secret": "<SHARED_TOKEN>" },
-       "send_caller_identity": true,
-       "provider": "Custom"
-     }
-   }
-   ```
+## Troubleshooting
 
-3. Call `shopshared` `whoami` from Aperture Chat with **Caller identity** unticked, then ticked. Unticked, the request has no `Tailscale-User-*` headers. Ticked, it carries that person's login, name, and picture. The tools stay `whoami` either way.
-4. To compare with Serve, point `shopshared` back at `https://mac-muon.taila6207e.ts.net/mcp`. The checkbox stops mattering. Serve writes the login of whoever owns the Aperture node, for every person. A tagged Aperture node gets no identity headers.
+### requested tags are invalid or not permitted
 
-## Aperture connectors
+```
+ERROR failed to start tsnet server error="tsnet.Up: tsnet: error resolving auth key:
+Status: 400, Message: \"requested tags [tag:tsidp] are invalid or not permitted\""
+```
 
-The gateway is `https://aperture.taila6207e.ts.net`. It can reach the shop server at `https://mac-muon.taila6207e.ts.net/mcp` after `tailscale serve --bg 9933`. In Aperture, open Administration, then Connectors (or Configuration at `/admin/settings/config`). Connector IDs are letters and digits only.
+The node asked the control plane to mint a key with that tag and was refused.
+Nothing is wrong with the container or the server; the tag request itself is
+correct. The two halves of the message are two different causes:
 
-`shopshared` uses one bearer for every granted user. The secret is `SHARED_TOKEN` in `.env`. That caller shows up as `sub` `shared` with no groups, so it only gets `whoami`. Caller identity headers only reach the server on the direct listener; see [Compare Caller identity on and off](#compare-caller-identity-on-and-off).
+| Message | Cause | Fix |
+| --- | --- | --- |
+| **invalid** | the tag is not in `tagOwners` | add it to the policy file |
+| **not permitted** | the OAuth client does not hold that tag | re-create the client with both tags, or use the owner-tag pattern above |
 
-`shopuser` is per-user. Aperture registers a client with tsidp (`oauth2_dcr`) and stores a separate token for each Tailscale user. Each person opens Connectors in Aperture Chat and selects Connect. Do that from an untagged device (the iPhone or another machine logged in as you). This Mac is tagged, and tsidp rejects that login.
+Because a client cannot be created with a tag that is not already in
+`tagOwners`, a client that exists but fails here was almost certainly created
+with only one of the two tags. Client tags cannot be edited — delete it and
+create a new one.
+
+`ts-shop` fails the same way for `${MCP_TAG}`, a few lines later in the log, so
+fix both tags at once.
+
+This error only appears because `TSNET_FORCE_LOGIN=1` makes tsidp actually use
+the key. Without it, tsnet would reuse the logged-in node already in `/data`,
+start up looking healthy, and stay **untagged**.
+
+### Tagged nodes need their own ACL rules
+
+Devices registered with OAuth client credentials are **tag-owned**, so they are
+no longer covered by any policy rule that grants access because you personally
+own the device. On a tailnet more restrictive than the default allow-all, add
+rules letting users reach `tag:tsidp:443` and `tag:mcpserver:443`, or the nodes
+register successfully and are still unreachable.
+
+### tagged node doesn't have a user identity
+
+tsidp rejected `/authorize`. The **client** device is tagged, and a tagged node
+has no user for tsidp to resolve with WhoIs. Connect from an untagged device.
+The two server nodes being tagged is unrelated and fine.
+
+### Tool list is smaller than expected
+
+`whoami` reports the `groups` and `capabilities` on the current token. An empty
+`groups` means no data domains, and `capabilities` falling back to `["read"]`
+means no claim arrived. Both come from the WhoIs snapshot taken at Connect, so
+after changing grants each person has to connect again and refresh tools.
+Remember `includeInUserInfo: true` — without it tsidp issues the claim but never
+exposes it on `/userinfo`, which is where the server reads it.
 
 ## Stop
 
@@ -333,4 +443,4 @@ The gateway is `https://aperture.taila6207e.ts.net`. It can reach the shop serve
 docker compose stop
 ```
 
-`docker compose down -v` also deletes the database volume, the tsidp node state, and the shop node state. A host `npm start` stops with Ctrl-C.
+`docker compose down -v` also deletes the catalog and both nodes' state.

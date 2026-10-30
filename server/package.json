@@ -6,13 +6,15 @@
     "start": "node --env-file=../.env src/index.js",
     "verify": "node --env-file=../.env src/verify.js"
   },
+  "engines": {
+    "node": ">=24"
+  },
   "dependencies": {
     "@modelcontextprotocol/client": "^2",
     "@modelcontextprotocol/express": "^2",
     "@modelcontextprotocol/node": "^2",
     "@modelcontextprotocol/server": "^2",
     "express": "^5",
-    "pg": "^8",
     "undici": "^8.12.3",
     "zod": "^4"
   }

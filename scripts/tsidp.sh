@@ -1,8 +1,11 @@
 #!/bin/bash
-# Upstream development mode: tsidp on the Mac's existing tailscaled.
-# Do not use this on mac-muon. The node is tagged, and tsidp rejects tagged
-# nodes at /authorize. Direct connections also skip Tailscale Serve, so WhoIs
-# fails. Use `docker compose up -d tsidp` instead.
+# Upstream development mode: tsidp on an existing local tailscaled, instead of
+# its own tsnet node. Only useful for hacking on tsidp itself.
+#
+# The node running this must be untagged. tsidp rejects a tagged node at
+# /authorize with "tagged node doesn't have a user identity", and a direct
+# connection also skips Tailscale Serve, so WhoIs has nothing to resolve.
+# For everything else use `docker compose up -d tsidp`.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export TAILSCALE_USE_WIP_CODE=1
