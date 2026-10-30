@@ -1,6 +1,6 @@
+# Four services. tsidp and the shop sidecar are tailnet nodes. Postgres is only
+# on the Compose network, reachable as db:5432, plus 127.0.0.1:54329 on the host.
 services:
-  # Separate tailnet node. No auth key on purpose: the container prints a
-  # login URL that has to be approved in the existing tailnet.
   tsidp:
     image: ghcr.io/tailscale/tsidp:latest
     container_name: tsidp-mcp-idp
@@ -17,20 +17,73 @@ services:
     image: postgres:16-alpine
     container_name: tsidp-mcp-db
     environment:
-      POSTGRES_USER: shop
-      POSTGRES_PASSWORD: shop-local
-      POSTGRES_DB: shop
+      POSTGRES_USER: ${POSTGRES_USER:-shop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-shop}
+      MCP_READER_PASSWORD: ${MCP_READER_PASSWORD:?Set MCP_READER_PASSWORD in .env}
     ports:
       - "127.0.0.1:54329:5432"
     volumes:
       - tsidp-mcp-pg:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./db/02-reader.sh:/docker-entrypoint-initdb.d/02-reader.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U shop -d shop"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shop} -d ${POSTGRES_DB:-shop}"]
       interval: 2s
       timeout: 5s
       retries: 30
 
+  # Userspace Tailscale: no /dev/net/tun, so it runs on Docker Desktop.
+  # Serve publishes HTTPS :443. TCP :9935 is a raw forward, so
+  # Tailscale-User-* headers are not rewritten.
+  ts-shop:
+    image: tailscale/tailscale:latest
+    container_name: tsidp-mcp-shop-ts
+    hostname: ${SHOP_HOSTNAME:-shop-mcp}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: ${SHOP_HOSTNAME:-shop-mcp}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      TS_ACCEPT_DNS: "false"
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_OUTBOUND_HTTP_PROXY_LISTEN: 127.0.0.1:1055
+    volumes:
+      - shop-ts-state:/var/lib/tailscale
+      - ./ts-shop:/config
+    restart: unless-stopped
+
+  shop:
+    build: ./server
+    container_name: tsidp-mcp-shop
+    network_mode: service:ts-shop
+    depends_on:
+      db:
+        condition: service_healthy
+      ts-shop:
+        condition: service_started
+    environment:
+      PORT: "9933"
+      TAILNET_BIND: 127.0.0.1
+      TAILNET_PORT: "9935"
+      INSPECTOR_PORT: "9934"
+      DATABASE_URL: postgres://mcp_reader:${MCP_READER_PASSWORD}@db:5432/${POSTGRES_DB:-shop}
+      TSIDP_URL: ${TSIDP_URL:?Set TSIDP_URL in .env}
+      RESOURCE_URL: ${SHOP_RESOURCE_URL:?Set SHOP_RESOURCE_URL to https://<shop-hostname>.<tailnet>.ts.net/mcp}
+      SHARED_TOKEN: ${SHARED_TOKEN:?Set SHARED_TOKEN in .env}
+      HTTPS_PROXY: http://127.0.0.1:1055
+      HTTP_PROXY: http://127.0.0.1:1055
+      NO_PROXY: db,localhost,127.0.0.1
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9933/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
 volumes:
   tsidp-mcp-pg:
   tsidp-data:
+  shop-ts-state:

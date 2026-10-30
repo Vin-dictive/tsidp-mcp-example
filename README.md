@@ -14,7 +14,7 @@ Tailnet: `taila6207e.ts.net`. This Mac is `mac-muon`.
 | `shopshared` | `https://mac-muon.taila6207e.ts.net/mcp` (Serve), or `http://mac-muon.taila6207e.ts.net:9935/mcp` (direct) to see Caller identity headers | `SHARED_TOKEN` | `whoami` |
 | `shopuser` | `https://mac-muon.taila6207e.ts.net/mcp` (Serve) | per-user tsidp token | by `groups` claim, see [Tool tiers](#tool-tiers) |
 
-Every call to `/mcp` shows up in the [call inspector](#call-inspector) at `http://127.0.0.1:9934/` (or `https://mac-muon.taila6207e.ts.net:8443/` on the tailnet), with its headers.
+The names in the rest of this document are this tailnet. To run the same stack on yours, follow [Run on your tailnet](#run-on-your-tailnet).
 
 ## How the shared credential works
 
@@ -35,9 +35,8 @@ flowchart TD
 
   url -- direct URL, http on 9935 --> direct["server/ on TAILNET_BIND:9935. Headers arrive as Aperture sent them"]
 
-  local --> record["Call inspector records headers, body, and response"]
-  direct --> record
-  record --> sharedok{"Bearer equals SHARED_TOKEN?"}
+  local --> sharedok{"Bearer equals SHARED_TOKEN?"}
+  direct --> sharedok
   sharedok -- no --> introspect["Treated as a tsidp token, see the per-user flow"]
   sharedok -- yes --> sharedtools["sub = shared, groups = none: whoami only. The Tailscale-User-* headers do not change the tools"]
 ```
@@ -102,6 +101,81 @@ Either way the login is still unsigned, so whoever holds the bearer can claim an
 Aperture can filter by group, but at the gateway rather than in the MCP server. Add the [`tailscale.com/visible-groups`](https://tailscale.com/docs/aperture/visible-groups) node attribute for the Aperture node, then use [`connectors` grants](https://tailscale.com/docs/aperture/how-to/grant-mcp-tool-access) such as `"shopshared/tools/list_products"` with a `group:` `src`. The upstream still sees one credential and has to return every tool, so that only works if the bearer gets the full set and every client goes through Aperture. Cursor pointed straight at the server would get the full set.
 
 With tsidp, the group is a claim on a per-user token that the server introspects. It works for any MCP client, including Cursor without Aperture, and the server holds no Tailscale admin credential.
+
+## Run on your tailnet
+
+`docker compose up -d` starts four services:
+
+| Service | Where it lives | What it is |
+| --- | --- | --- |
+| `tsidp` | its own tailnet node, `idp.<tailnet>.ts.net` | Tailscale's OIDC provider |
+| `ts-shop` | its own tailnet node, `shop-mcp.<tailnet>.ts.net` | Tailscale, in userspace mode. No `/dev/net/tun`, so it runs on Docker Desktop |
+| `shop` | shares `ts-shop`'s network | the MCP server |
+| `db` | the Compose network only | Postgres. Other containers reach it as `db:5432`. It has no tailnet address. The host can reach it at `127.0.0.1:54329` |
+
+The sidecar publishes two ports on the shop node:
+
+| Port | Mode | URL |
+| --- | --- | --- |
+| 443 | HTTPS Serve. Rewrites `Tailscale-User-*` headers | `https://shop-mcp.<tailnet>.ts.net/mcp` |
+| 9935 | raw TCP forward to the server. Headers arrive unchanged | `http://shop-mcp.<tailnet>.ts.net:9935/mcp` |
+| 8443 | HTTPS Serve, the call inspector | `https://shop-mcp.<tailnet>.ts.net:8443/` |
+
+The server reaches tsidp through the sidecar's HTTP proxy, because userspace mode has no tunnel interface. Postgres is excluded from that proxy.
+
+### Before the first start
+
+1. Docker, and a tailnet with MagicDNS and HTTPS certificates turned on at <https://login.tailscale.com/admin/dns>.
+2. An Aperture gateway on that tailnet, if you want the two connectors.
+3. Copy the env file and fill it in. Passwords must not contain `@`, `:`, `/`, or a space.
+
+   ```bash
+   cp example.env .env
+   ```
+
+   `TSIDP_URL` is `https://idp.<tailnet>.ts.net`. `SHOP_RESOURCE_URL` is `https://shop-mcp.<tailnet>.ts.net/mcp`. Generate `SHARED_TOKEN` with `openssl rand -hex 24`.
+
+   `TS_AUTHKEY` is optional. An auth key from <https://login.tailscale.com/admin/settings/keys> lets `ts-shop` join on its own. Leave it empty to approve a login URL instead. Do not commit a real key.
+
+### Start
+
+```bash
+docker compose up -d --build
+docker compose logs -f tsidp ts-shop
+```
+
+Each of those two containers prints a `https://login.tailscale.com/a/...` URL the first time, unless `TS_AUTHKEY` is set. Approve both. `tsidp` becomes `idp`, and `ts-shop` becomes `shop-mcp`. HTTPS for the new names can take a minute.
+
+```bash
+curl -4sS https://idp.<tailnet>.ts.net/.well-known/openid-configuration
+curl -4sS -o /dev/null -w "%{http_code}\n" https://shop-mcp.<tailnet>.ts.net/mcp
+```
+
+The second command returns `401`. That is the MCP server answering.
+
+The database init scripts run only when the data volume is first created. `docker compose down -v` deletes that volume, the tsidp node state, and the shop node state.
+
+### Tailnet policy
+
+In the [grants below](#all-four-grants), change two things:
+
+- `resources` becomes your `SHOP_RESOURCE_URL`, character for character. tsidp checks it when it issues a token.
+- The `allow_dcr` grant's `src` becomes the login of the Aperture node on your tailnet. tsidp denies `/register` to anyone else.
+
+The `autogroup` grants need no names from your tailnet. They stamp `groups` onto whoever connects.
+
+Aperture also needs its own grants for `shopshared/**` and `shopuser/**`. Those live in the Aperture configuration, not in the tailnet policy.
+
+Connect `shopuser` from an untagged device. tsidp rejects `/authorize` from a tagged node with `tagged node doesn't have a user identity`.
+
+### Aperture
+
+| Connector | URL | Caller identity |
+| --- | --- | --- |
+| `shopuser` | `https://shop-mcp.<tailnet>.ts.net/mcp` | leave unticked. The per-user token carries the identity |
+| `shopshared` | `http://shop-mcp.<tailnet>.ts.net:9935/mcp` | ticked, when you want the caller's login in the headers |
+
+`shopshared` on port 443 shows the Aperture node's owner in the headers, whichever person is chatting. Port 9935 shows the person. Neither header changes the tools: the shared bearer gets `whoami` only.
 
 ## Start the database
 
@@ -205,55 +279,29 @@ Aperture connector grants (`shopshared/**`, `shopuser/**`) are set in the Apertu
 
 ## Start the MCP server
 
+The Compose file starts it. See [Run on your tailnet](#run-on-your-tailnet).
+
+```bash
+docker compose up -d --build shop
+```
+
+To run it on the host instead, for development:
+
 ```bash
 cd ~/Projects/tsidp-mcp/server
 npm install
 npm start
 ```
 
-`npm run verify` checks the seed data, the tool list, and the tool tiers against the running database.
-
-The server always listens on `127.0.0.1:9933`, which `tailscale serve --bg 9933` publishes. With `TAILNET_BIND` set in `.env` (this Mac's `tailscale ip -4`, `100.78.230.18`), it also listens on `TAILNET_BIND:9935`. Nothing rewrites headers on that port. Do not publish 9935 with `tailscale serve`, or Serve will rewrite them.
-
-## Call inspector
-
-Open `http://127.0.0.1:9934/` on this Mac. The page updates live. To open it from another tailnet device, publish it over HTTPS:
-
-```bash
-tailscale serve --bg --https=8443 http://127.0.0.1:9934
-```
-
-Then use `https://mac-muon.taila6207e.ts.net:8443/`. Anyone the tailnet policy lets reach `mac-muon` can see the recorded calls, including logins and bodies. Bearer tokens stay redacted. `tailscale serve --https=8443 off` removes it.
+`npm run verify` checks the seed data, the tool list, and the tool tiers against the database at `127.0.0.1:54329`. The host process listens on `127.0.0.1:9933`. With `TAILNET_BIND` set to this machine's `tailscale ip -4`, it also listens on that address at `TAILNET_PORT`, and nothing rewrites headers there. Do not publish that port with `tailscale serve`, or Serve will rewrite them. The container does not need `TAILNET_BIND`: its sidecar forwards tailnet port 9935 to `127.0.0.1:9935` as raw TCP.
 
 Browsers cannot open `http://mac-muon.taila6207e.ts.net:9935/` (or any plain `http://` `*.ts.net` URL). `ts.net` is on the HSTS preload list, so the browser switches to HTTPS, and port 9935 only speaks HTTP. Aperture and curl are not browsers and use the 9935 URL fine.
 
-The strip at the top lists everyone who has called, with their groups, how many tools they get, and how many requests and tool calls they made. Click a person to show only their calls.
-
-Each request to `/mcp` is one row, including ones that fail auth. The columns:
-
-- **User (verified):** the person the server authenticated. For a tsidp token this is the email tsidp vouched for. The shared bearer shows "shared bearer, no user", because it does not identify a person
-- **Groups:** the `groups` claim the server used to pick tools
-- **Call** and **Status:** the JSON-RPC method and tool name, and the HTTP status
-- **Via:** `Serve` (port 9933) or `direct` (port 9935)
-- **Header login (not verified):** the `Tailscale-User-Login` header and where it came from. When it names someone other than the verified user, the row says so
-
-Selecting a row shows the verified user, their groups, and their tools first, then the identity headers, every request header (`Authorization` and `Cookie` show only the scheme and the length), the body, and the response.
-
-Through Serve, the header login on a `shopuser` call is the Aperture node's owner, not the person. For example, Vinnie's calls show `vinay.valson@gmail.com` in the header column, with a note that it differs from the verified user.
-
-The badge in the header column says where the `Tailscale-User-*` headers came from:
-
-| Badge | Meaning |
-| --- | --- |
-| sent by caller | The headers arrived exactly as the client sent them. Through Aperture on port 9935, this is the Caller identity option. |
-| set by Tailscale Serve | Serve deleted anything the client sent and wrote the identity of the device that connected. Serve also adds `Tailscale-Headers-Info` when it does this. |
-| none | No identity headers. |
-
-The last 200 calls are kept in memory. Restarting the server clears them, as does Clear.
-
 ### Compare Caller identity on and off
 
-1. Set `TAILNET_BIND=100.78.230.18` in `.env` and restart. The log prints `Listening on http://100.78.230.18:9935/mcp`.
+On the Compose service the direct URL is already `http://<shop-hostname>.<tailnet>.ts.net:9935/mcp`. The steps below are the host-run server on this machine.
+
+1. Set `TAILNET_BIND` to this machine's Tailscale address in `.env` and restart. The log prints `Listening on http://<tailscale-ip>:9935/mcp`.
 2. In Aperture, set the `shopshared` URL to the direct listener. `send_caller_identity` only accepts a MagicDNS name or a Tailscale IP, and this URL is a MagicDNS name.
 
    ```json
@@ -268,8 +316,8 @@ The last 200 calls are kept in memory. Restarting the server clears them, as doe
    }
    ```
 
-3. Call `shopshared` `whoami` from Aperture Chat with **Caller identity** unticked, then ticked. Unticked calls show `none`. Ticked calls show `sent by caller` with your login, name, and picture. The tools stay `whoami` either way.
-4. To compare with Serve, point `shopshared` back at `https://mac-muon.taila6207e.ts.net/mcp`. The checkbox stops mattering. If the Aperture node is logged in as a user, every call shows `set by Tailscale Serve` with that user's login, whoever is chatting. If the node is tagged, calls show `none`.
+3. Call `shopshared` `whoami` from Aperture Chat with **Caller identity** unticked, then ticked. Unticked, the request has no `Tailscale-User-*` headers. Ticked, it carries that person's login, name, and picture. The tools stay `whoami` either way.
+4. To compare with Serve, point `shopshared` back at `https://mac-muon.taila6207e.ts.net/mcp`. The checkbox stops mattering. Serve writes the login of whoever owns the Aperture node, for every person. A tagged Aperture node gets no identity headers.
 
 ## Aperture connectors
 
@@ -282,8 +330,7 @@ The gateway is `https://aperture.taila6207e.ts.net`. It can reach the shop serve
 ## Stop
 
 ```bash
-# Ctrl-C the npm process, then:
 docker compose stop
 ```
 
-`docker compose down -v` also deletes the database volume and the tsidp node state.
+`docker compose down -v` also deletes the database volume, the tsidp node state, and the shop node state. A host `npm start` stops with Ctrl-C.

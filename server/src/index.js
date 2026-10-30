@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
 import { createMcpHandler, McpServer, OAuthError, OAuthErrorCode } from "@modelcontextprotocol/server";
 import {
   createMcpExpressApp,
@@ -12,12 +13,20 @@ import { getPool } from "./catalog.js";
 import { createInspector } from "./inspector.js";
 import { registerCatalogTools } from "./tools.js";
 
+// The Docker Tailscale sidecar runs in userspace mode, which has no tunnel device.
+// Tailnet calls (tsidp) go through its HTTP proxy. NO_PROXY keeps Postgres direct.
+if (process.env.HTTPS_PROXY || process.env.HTTP_PROXY) {
+  setGlobalDispatcher(new EnvHttpProxyAgent());
+}
+
 const port = Number(process.env.PORT || 9933);
-// Optional second listener on this machine's Tailscale address. Tailscale Serve rewrites
-// Tailscale-User-* headers, so callers that send their own (Aperture's Caller identity) need this path.
+// Second listener for caller-identity headers. On the host this is the Tailscale address,
+// because Tailscale Serve rewrites those headers. In Docker it is 127.0.0.1:9935, and the
+// sidecar forwards tailnet TCP port 9935 there without touching the HTTP headers.
 const tailnetBind = process.env.TAILNET_BIND || "";
 const tailnetPort = Number(process.env.TAILNET_PORT || 9935);
-const inspectorPort = Number(process.env.INSPECTOR_PORT || 9934);
+const inspectorPort = process.env.INSPECTOR_PORT ? Number(process.env.INSPECTOR_PORT) : 0;
+const inspectorHost = process.env.INSPECTOR_HOST || "127.0.0.1";
 const tsidpUrl = new URL(requiredEnv("TSIDP_URL"));
 const resourceUrl = new URL(requiredEnv("RESOURCE_URL"));
 const scopes = ["openid", "email", "profile"];
@@ -219,7 +228,7 @@ const auth = requireBearerAuth({
 const app = createMcpExpressApp({
   allowedHosts: ["127.0.0.1", "localhost", resourceUrl.hostname, ...(tailnetBind ? [tailnetBind] : [])],
 });
-const inspector = createInspector();
+const inspector = inspectorPort ? createInspector() : null;
 
 function metadata(res, body) {
   res.set("Access-Control-Allow-Origin", "*");
@@ -253,9 +262,11 @@ app.get("/health", async (_req, res) => {
 
 const nodeHandler = toNodeHandler(createMcpHandler(buildServer));
 const listenerFor = (req) => (req.socket.localPort === port ? "localhost (Serve)" : "tailnet direct");
-app.all("/mcp", inspector.record(listenerFor), auth, (req, res) => {
+const mcpHandler = (req, res) => {
   void nodeHandler(req, res, req.body);
-});
+};
+if (inspector) app.all("/mcp", inspector.record(listenerFor), auth, mcpHandler);
+else app.all("/mcp", auth, mcpHandler);
 
 function exitOnError(server) {
   server.on("error", (err) => {
@@ -277,6 +288,8 @@ if (tailnetBind) {
   }));
 }
 
-exitOnError(inspector.listen({ host: "127.0.0.1", port: inspectorPort }).on("listening", () => {
-  console.log(`Call inspector: http://127.0.0.1:${inspectorPort}/`);
-}));
+if (inspector) {
+  exitOnError(inspector.listen({ host: inspectorHost, port: inspectorPort }).on("listening", () => {
+    console.log(`Call inspector: http://${inspectorHost}:${inspectorPort}/`);
+  }));
+}

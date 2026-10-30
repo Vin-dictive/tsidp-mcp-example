@@ -71,7 +71,5 @@ INSERT INTO order_items (order_id, sku, quantity) VALUES
   (108, 'COL-5', 2),
   (108, 'DEC-8', 12);
 
-CREATE USER mcp_reader WITH PASSWORD 'mcp-reader-local';
-GRANT CONNECT ON DATABASE shop TO mcp_reader;
-GRANT USAGE ON SCHEMA public TO mcp_reader;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO mcp_reader;
+-- The mcp_reader role is created by 02-reader.sh, using MCP_READER_PASSWORD.
+-- These scripts run only when the data volume is created.
